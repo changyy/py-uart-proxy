@@ -40,10 +40,16 @@ def test_full_client_receives_rx_and_can_write():
         assert client.role == Role.FULL
 
         # Device output is forwarded to the client and reconstructed as bytes.
-        device.feed(b"hello\n")
         received = bytearray()
 
         def pump():
+            # Re-feed on each poll: the client's subscription on the server may
+            # not be live the instant open() returns (the server registers it
+            # from its writer thread), so a single feed can race that window and
+            # be dropped — and with only one feed there'd be nothing to receive
+            # afterwards. Feeding until observed makes the forwarding assertion
+            # robust on slow / loaded CI runners without masking a real failure.
+            device.feed(b"hello\n")
             received.extend(client.read(4096, timeout=0.2))
             return b"hello\n" in bytes(received)
 
