@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uart-proxy"
+# Version is read dynamically from src/uart_proxy/_version.py (single source of
+# truth). Scheme: 1.YYYYmmdd.1HHmmss. See [tool.hatch.version] below.
+dynamic = ["version"]
+description = "A cross-platform UART log reader / controller with timestamping, file recording, socket proxy, and a plugin system."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Yuan-Yi Chang", email = "changyy.csie@gmail.com" }]
+keywords = ["uart", "serial", "putty", "minicom", "proxy", "log", "terminal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications",
+    "Topic :: System :: Hardware",
+    "Topic :: Terminals :: Serial",
+]
+
+dependencies = [
+    # The serial engine, published on PyPI (built on pyserial).
+    "uart-helper>=1.0",
+    "pyserial>=3.5",
+    # The Textual TUI is the default interactive experience, so it ships in
+    # core — `pip install uart-proxy` is enough to run `uart-proxy connect`.
+    "textual>=0.60",
+]
+
+[project.optional-dependencies]
+# Kept for backwards compatibility. textual is now a core dependency, so this
+# extra is redundant — `pip install uart-proxy` already includes the TUI.
+tui = ["textual>=0.60"]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/changyy/py-uart-proxy"
+Repository = "https://github.com/changyy/py-uart-proxy"
+Issues = "https://github.com/changyy/py-uart-proxy/issues"
+Changelog = "https://github.com/changyy/py-uart-proxy/blob/main/CHANGELOG.md"
+
+[project.scripts]
+uart-proxy = "uart_proxy.cli:main"
+
+[tool.hatch.version]
+path = "src/uart_proxy/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uart_proxy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

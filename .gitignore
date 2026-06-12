@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Project-specific ─────────────────────────────────────────────────────────
+# Local dev tooling / editor assistants — never publish
+.claude/
+CLAUDE.md
+.cursor/
+.aider*
+
+# macOS
+.DS_Store
+
+# Editor scratch
+*.swp
+
+# Runtime UART log output (also covered by *.log above, kept explicit)
+output*.log
