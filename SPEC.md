@@ -206,3 +206,79 @@ include a box border and padding):
 - A fresh log has `auto_scroll` (follow) enabled.
 - Simulating a mouse-scroll-up disables follow; `jump_to_bottom()` (or
   reaching the bottom) re-enables it.
+
+## S14. Local PTY mirrors (sharing one port)
+
+uart-proxy holds the physical port (S15), so nothing else on the machine can
+reach the device. Mirrors are the way back in: N **full-duplex PTYs**, each
+symlinked into a directory, that any serial-capable tool can open.
+
+- Enabled by `--proxy-dir [DIR]` (default `/tmp/uart-proxy`) and/or repeated
+  `--proxy PATH`. Off unless asked for. `--proxy-count N` sets how many
+  auto-named mirrors (default **2**); `--proxy` alone creates only the paths
+  given.
+- Each mirror is **read *and* write**, so `--proxy-count 2` is 2 readers *and*
+  2 writers. Links are named `<stem>-<i>` where `<stem>` is the device basename
+  with a `cu.`/`tty.` prefix stripped (`/dev/cu.usbserial-110` → `usbserial-110-0`).
+- **RX is broadcast**: every mirror receives the whole device output stream.
+- **RX only** — a mirror never sees another mirror's TX, nor assembled LINE
+  events. (Real consoles echo, so a human still sees an agent's command; staying
+  transparent is what lets an unmodified `screen` attach.)
+- **TX is merged** onto the one wire. `--tx-merge line` (default) buffers each
+  mirror's bytes until `\n` or `\r` and forwards the whole line in one write, so
+  two writers can never splice one command into another; a line that never
+  terminates is flushed at 4096 B. `--tx-merge raw` forwards bytes immediately.
+- Mirror TX goes through `session.write`, so it appears in the TUI and the logs
+  as ordinary TX, and is refused (reported, not fatal) while disconnected.
+- A mirror whose client stops reading is **dropped from, not blocked on**: past
+  1 MiB of backlog its bytes are discarded and counted, so one stalled reader
+  can neither stall the device read thread nor starve the other mirrors.
+- Startup replaces a **stale symlink** from a killed run; a path that exists and
+  is *not* a symlink is refused, never deleted. `SIGTERM` as well as `Ctrl-C`
+  removes the symlinks.
+- POSIX only (no `pty` on Windows); `--proxy-dir` there is an error pointing at
+  `--serve`.
+- **Not** provided: per-writer request/response routing. A UART is one unframed
+  byte stream, so which reply belongs to which writer is not answerable at this
+  layer — `line` merge keeps commands intact, correlation is the caller's job.
+
+**Acceptance**
+- Starting a group creates one symlink per mirror, each pointing at a `/dev`
+  PTY a client can open; stopping it removes them.
+- A `DATA(RX)` event published on the bus is received by every attached client;
+  a `DATA(TX)` or `LINE(RX)` event is received by none.
+- Bytes written by a client arrive at `on_tx`; with `line` merge, two clients
+  writing `reb`/`who` then `oot\n`/`ami\n` produce exactly `reboot\n` and
+  `whoami\n`, and nothing is forwarded while both lines are partial.
+- With `raw` merge, `no newline here` is forwarded without a terminator.
+- A client that never reads records a non-zero `dropped` count while another
+  client continues to receive.
+- `on_tx` raising (disconnected device) emits a notice and the group keeps
+  serving; a later write succeeds.
+- A dangling symlink at a mirror path is replaced; a regular file there raises
+  `FileExistsError` and is left intact.
+
+## S15. Exclusive claim on the physical port
+
+- `connect` claims the port **exclusively** by default, via `TIOCEXCL` on the
+  open fd: every later `open()` of that device path fails with `EBUSY`, so a
+  second program cannot start splitting the byte stream with us. Sharing is done
+  through mirrors (S14) or the socket proxy (S6), never by two opens of one wire.
+- `--no-exclusive` opts out.
+- Best-effort by design: Windows COM ports are already exclusive-open, and a
+  failure to claim (odd platform, non-tty, a future `uart_helper` that hides its
+  port object) is logged and the session continues. `UartSource.is_exclusive`
+  reports what was actually obtained.
+- This is deliberately **not** pyserial's `exclusive=True`, which takes an
+  advisory `flock` — `screen` does not `flock`, so that would not stop it.
+
+**Acceptance**
+- `seize_exclusive` returns True for a tty fd and False (no raise) for a pipe.
+- `UartSource.open()` claims the port's own fd by default; `exclusive=False`
+  claims nothing; `close()` clears `is_exclusive`.
+- An unreachable port object leaves `open()` working and `is_exclusive` False.
+- **Manual (needs hardware)** — the pty driver ignores `TIOCEXCL`, so kernel
+  enforcement cannot be tested in CI. With a real adapter attached:
+  `uart-proxy connect --port /dev/cu.usbserial-110`, then in another terminal
+  `screen /dev/cu.usbserial-110` must fail with `Resource busy` (errno 16),
+  while `screen /tmp/uart-proxy/usbserial-110-0` attaches.

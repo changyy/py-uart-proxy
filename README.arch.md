@@ -34,19 +34,28 @@ This document explains how the PC app is put together and why. For usage see
            │          write   │ assembly + counters   │               └──────┬──────┘
    ┌───────┴────────┐         └──────────────────────┘                       │ fan-out
    │ UartSource     │  (uart_helper.UARTDevice → pyserial)                    │
-   │ SocketSource   │  (remote uart-proxy, JSON-lines client)        ┌────────┼─────────┬──────────────┐
-   └────────────────┘                                                ▼        ▼         ▼              ▼
-                                                              ┌──────────┐ ┌────────┐ ┌──────────┐ ┌──────────┐
-                                                              │ Recorder │ │ Plugin │ │  Proxy   │ │   UI     │
-                                                              │ 3 files  │ │Manager │ │ Server   │ │ TUI /    │
-                                                              └──────────┘ └────────┘ └────┬─────┘ │ headless │
-                                                                                           │       └──────────┘
-                                                                              JSON-lines over TCP (auth + role)
-                                                                                           │
-                                                                          ┌────────────────┴───────────────┐
-                                                                          ▼                                ▼
-                                                                  remote PC (uart-proxy remote)     future mobile (Flutter)
+   │ SocketSource   │  (remote uart-proxy, JSON-lines client)  ┌──────┼──────┬───────┬───────┐
+   └────────────────┘                                          ▼      ▼      ▼       ▼       ▼
+                                                        ┌────────┐ ┌──────┐ ┌─────┐ ┌─────┐ ┌────────┐
+                                                        │Recorder│ │Plugin│ │Proxy│ │ Pty │ │  UI    │
+                                                        │3 files │ │ Mgr  │ │Srvr │ │Proxy│ │ TUI /  │
+                                                        └────────┘ └──────┘ └──┬──┘ │Group│ │headless│
+                                                                               │    └──┬──┘ └────────┘
+                                                            JSON-lines over TCP│       │ N full-duplex PTYs,
+                                                            (auth + role)      │       │ symlinked in --proxy-dir
+                                                                   ┌───────────┴──┐    │
+                                                                   ▼              ▼    ▼
+                                                             remote PC       mobile   screen · minicom ·
+                                                        (uart-proxy remote) (Flutter) pyserial · an AI agent
 ```
+
+`ProxyServer` and `PtyProxyGroup` are the two **sinks with a way back in**: each
+takes RX off the bus and feeds TX to `session.write`. Neither touches the
+transport, so both work the same whether the session is driving a local UART or a
+remote stream. The difference is reach and honesty about it — the socket protocol
+has framing, auth and roles, so it can attribute a message to a client; a PTY is
+a raw byte pipe, which is exactly why any serial tool can attach to one and
+exactly why it cannot tell you whose reply is whose.
 
 ## The dual time axis
 
@@ -70,6 +79,7 @@ window views:
 source.read() ─► bytes
    │
    ├─► Event(DATA, RX)                  → live display · raw output.log · proxy rx
+   │                                      · broadcast to every PTY mirror
    └─► LineAssembler.feed() ─► lines
             └─► Event(LINE, RX)         → output-timestamp.log
                                           output-fulltimestamp.log
@@ -80,6 +90,11 @@ source.read() ─► bytes
 flush emits a buffered partial line so prompts without a trailing newline (e.g.
 `login: `) still surface.
 
+TX events are *not* sent to the PTY mirrors: a mirror carries device output only,
+so an attached tool cannot mistake our own echo for the device's answer. Anything
+a mirror writes enters through `session.write`, which means it appears in the TUI
+and the logs like any other TX.
+
 ## Threading model
 
 | Thread | Owner | Job |
@@ -88,11 +103,28 @@ flush emits a buffered partial line so prompts without a trailing newline (e.g.
 | accept | `ProxyServer` | accept TCP clients |
 | reader (per client) | `ProxyServer` | parse client→server messages (tx/ping) |
 | writer (per client) | `ProxyServer` | drain that client's queue to its socket |
+| pty-proxy | `PtyProxyGroup` | one `selectors` loop over every mirror's PTY |
 | main / asyncio | Textual TUI | render; bus callbacks hop in via `call_from_thread` |
 
 Bus callbacks run in the publishing (read) thread and must be quick. The proxy
 only *enqueues* bytes per client, so a slow remote client can never stall the
 serial pump (its queue fills and the client is dropped).
+
+`PtyProxyGroup` applies the same rule with one thread for *all* mirrors: the bus
+callback only appends to each mirror's buffer and pokes a self-pipe, and the loop
+writes only where `select` says there is room. A client that stops reading fills
+its PTY buffer, then its backlog cap, and then its bytes are dropped and counted
+— it cannot stall the serial pump or the other mirrors. Because that one loop is
+also the only writer to the wire, a whole line is inherently indivisible in
+`--tx-merge line` mode; no extra lock is needed for atomicity.
+
+### Exclusive claim on the wire
+
+Sharing must be deliberate, so `UartSource` claims the port with `TIOCEXCL`
+(default; `--no-exclusive` opts out). This matters most on macOS/Linux, where the
+tty layer would otherwise let a second process open the same device and split the
+byte stream with us — silently. `TIOCEXCL` is kernel-enforced, unlike pyserial's
+`exclusive=True` (an advisory `flock` that `screen` ignores) — see SPEC S15.
 
 ## Proxy protocol (summary)
 

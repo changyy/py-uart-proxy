@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 from typing import Optional
@@ -28,6 +29,15 @@ from typing import Optional
 from uart_helper import SerialMonitor, UARTConfig
 
 from . import __version__
+from .core.pty_proxy import (
+    DEFAULT_PROXY_COUNT,
+    DEFAULT_PROXY_DIR,
+    PTY_SUPPORTED,
+    TX_MERGE_MODES,
+    PtyProxyGroup,
+    build_links,
+    device_stem,
+)
 from .core.session import UartSession
 from .core.recorder import Recorder
 from .core.retention import (
@@ -255,6 +265,74 @@ def _maybe_build_proxy(session: UartSession, args: argparse.Namespace) -> Option
     return ProxyServer(session, auth, host=args.listen, port=args.listen_port)
 
 
+def _maybe_build_pty_proxy(
+    session: UartSession, args: argparse.Namespace
+) -> Optional[PtyProxyGroup]:
+    """Build the local PTY mirror group, if the user asked for one.
+
+    Enabled by ``--proxy-dir`` or any ``--proxy PATH`` — mirroring the way
+    ``--serve`` enables the socket proxy.
+    """
+    proxy_dir = getattr(args, "proxy_dir", None)
+    explicit = list(getattr(args, "proxy", None) or [])
+    if not proxy_dir and not explicit:
+        return None
+    if not PTY_SUPPORTED:
+        raise RuntimeError(
+            "--proxy-dir/--proxy need a POSIX platform (Windows has no pty); "
+            "use --serve for a TCP proxy instead"
+        )
+
+    count = getattr(args, "proxy_count", DEFAULT_PROXY_COUNT)
+    links = build_links(
+        proxy_dir or DEFAULT_PROXY_DIR,
+        device_stem(getattr(args, "port", "") or "uart"),
+        count if proxy_dir else 0,
+        extra=explicit,
+    )
+    return PtyProxyGroup(
+        links,
+        session.write,
+        tx_merge=args.tx_merge,
+        on_notice=session.publish_notice,
+    )
+
+
+def _report_mirrors(group: PtyProxyGroup, port: str) -> None:
+    stats = group.stats()
+    print(
+        f"Sharing {port} via {len(stats)} PTY mirror(s), tx-merge={group.tx_merge}:",
+        file=sys.stderr,
+    )
+    for mirror in stats:
+        print(f"  {mirror.link} -> {mirror.slave}", file=sys.stderr)
+    if stats:
+        print(f"Attach with:  screen {stats[0].link}", file=sys.stderr)
+
+
+def _trap_sigterm():
+    """Turn SIGTERM into KeyboardInterrupt so ``finally`` cleanup still runs.
+
+    Returns a callable that restores the previous handler, or None if this
+    platform/thread can't install one.
+    """
+    def _raise(signum, frame):  # noqa: ANN001, ARG001
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, _raise)
+    except (ValueError, AttributeError, OSError):
+        return None  # not the main thread, or no SIGTERM here
+
+    def _restore() -> None:
+        try:
+            signal.signal(signal.SIGTERM, previous)
+        except (ValueError, OSError):
+            pass
+
+    return _restore
+
+
 def _run_session(
     session: UartSession,
     args: argparse.Namespace,
@@ -279,6 +357,7 @@ def _run_session(
     recorder = _attach_recorder(session, args)
     plugins = _build_plugins(session, args)
     proxy = _maybe_build_proxy(session, args)
+    mirrors = _maybe_build_pty_proxy(session, args)
 
     log_dir = os.path.normpath(os.path.dirname(recorder.raw_path)) if recorder is not None else None
     if log_dir:
@@ -288,6 +367,14 @@ def _run_session(
     if proxy is not None:
         proxy.start()
         print(f"Proxy listening on {args.listen}:{args.listen_port}", file=sys.stderr)
+    if mirrors is not None:
+        session.bus.subscribe(mirrors.handle)
+        mirrors.start()
+        _report_mirrors(mirrors, getattr(args, "port", "the session"))
+
+    # The mirrors leave symlinks on disk, so a plain SIGTERM (not just Ctrl-C)
+    # has to reach the cleanup in `finally` rather than killing us outright.
+    restore_term = _trap_sigterm() if mirrors is not None else None
 
     try:
         if args.no_tui:
@@ -302,6 +389,10 @@ def _run_session(
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
+        if restore_term is not None:
+            restore_term()
+        if mirrors is not None:
+            mirrors.stop()
         if proxy is not None:
             proxy.stop()
         plugins.stop()
@@ -320,7 +411,7 @@ def _run_session(
 
 def cmd_connect(args: argparse.Namespace) -> int:
     config = _build_config(args)
-    source = UartSource(args.port, config)
+    source = UartSource(args.port, config, exclusive=not args.no_exclusive)
     session = UartSession(
         source,
         encoding=args.encoding,
@@ -438,6 +529,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_conn.add_argument("--listen-port", type=int, default=9600, help="Proxy port.")
     p_conn.add_argument("--auth", action="append", metavar="CODE[:role]",
                         help="Auth code, optional role (full|readonly). Repeatable.")
+    p_conn.add_argument("--no-exclusive", action="store_true",
+                        help="Don't claim the port exclusively (TIOCEXCL). By "
+                             "default nothing else on this machine can open it, "
+                             "so two programs can't silently split the stream.")
+    # local PTY mirrors (POSIX)
+    p_conn.add_argument("--proxy-dir", nargs="?", const=DEFAULT_PROXY_DIR, default=None,
+                        metavar="DIR",
+                        help="Share this port as read/write PTY mirrors, "
+                             f"symlinked into DIR (default {DEFAULT_PROXY_DIR}). "
+                             "Any tool (screen, minicom, pyserial) can then "
+                             "attach while uart-proxy keeps the real port.")
+    p_conn.add_argument("--proxy-count", type=int, default=DEFAULT_PROXY_COUNT,
+                        metavar="N",
+                        help=f"How many mirrors to expose (default "
+                             f"{DEFAULT_PROXY_COUNT}). Each is full-duplex, so N "
+                             f"mirrors means N readers and N writers.")
+    p_conn.add_argument("--proxy", action="append", metavar="PATH",
+                        help="Expose a mirror at exactly PATH (repeatable); "
+                             "use instead of / alongside --proxy-dir.")
+    p_conn.add_argument("--tx-merge", choices=list(TX_MERGE_MODES), default="line",
+                        help="How concurrent mirror writers combine onto the one "
+                             "wire: line = buffer until a line ending, then write "
+                             "the whole line so commands never interleave "
+                             "(default); raw = pass bytes straight through.")
     _add_common_io_args(p_conn)
     p_conn.set_defaults(func=cmd_connect)
 

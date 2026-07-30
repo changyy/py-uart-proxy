@@ -34,9 +34,23 @@ The seven original requirements, implemented end to end.
   SPEC S12). Still polling-based on the same path; matching a re-enumerated
   path (e.g. usbserial-110→120) via `SerialMonitor` is a future refinement.
 - ✅ **Selection & clipboard** in the TUI (drag-select + Cmd/Ctrl+C; SPEC S13).
+- ✅ **Exclusive claim on the port** (SPEC S15): `connect` now takes `TIOCEXCL`
+  so no other program can open the same wire behind our back (pyserial's
+  `exclusive=True` is only an advisory `flock`, which `screen` ignores).
+  `--no-exclusive` opts out. Kernel enforcement is real-hardware-only —
+  the pty driver ignores `TIOCEXCL`, so CI can only assert we ask for it.
+- ✅ **Local PTY mirrors** (SPEC S14): `connect --proxy-dir DIR [--proxy-count N]`
+  exposes N full-duplex PTYs (default 2 = 2 readers *and* 2 writers), symlinked
+  into `DIR`, so `screen` / `minicom` / pyserial / an agent can share the one
+  port while uart-proxy keeps it. RX broadcast, TX line-atomic merged
+  (`--tx-merge raw` to pass bytes straight through). POSIX only.
+  - 💡 Extend it to `remote` too (mirror a *remote* stream locally) — the sink is
+    already source-agnostic; only the `remote` subparser lacks the flags.
+  - 💡 Surface mirror count / dropped bytes in the TUI status bar.
 - ⬜ **Port-busy hint**: when opening a port fails because another process holds
-  it (UART is exclusive-open), detect this and suggest attaching to an existing
-  proxy via `uart-proxy remote` instead.
+  it (UART is exclusive-open — and now doubly so, since we claim it ourselves),
+  detect this and suggest attaching via `uart-proxy remote` or a PTY mirror
+  instead.
 - ⬜ **Telnet IAC handling**: minimal negotiation so real telnet/BBS sessions
   render cleanly (currently raw passthrough).
 - ⬜ **TUI port picker**: when `--port` is omitted, show a selectable list.
@@ -104,6 +118,13 @@ Not changing the library here — collecting suggestions for its maintainers:
   shutdown doesn't wait out the timeout.
 - 💡 **Expose a raw line iterator** with hot-plug-aware reconnection, to back
   the v0.2 auto-reconnect feature.
+- 💡 **A way to reach the open port's fd, or claim it exclusively.** For SPEC S15
+  we need `TIOCEXCL` on the fd, and `UARTDevice` keeps its `serial.Serial`
+  private with no `fileno()`, so `UartSource._fileno()` reaches for `_serial`
+  defensively. Either a public `fileno()` or an `exclusive` flag on `UARTConfig`
+  would remove the private-attribute dependency. Note pyserial's own
+  `exclusive=True` is just an advisory `flock` and does **not** stop `screen`,
+  so the flag would need to issue `TIOCEXCL` to be useful.
 
 ## Open questions
 

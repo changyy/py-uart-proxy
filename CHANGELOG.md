@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.20260730.1220937] — 2026-07-30
+
+Share one physical UART with several local tools — and stop anyone taking it by
+accident.
+
+### Added
+- **Local PTY mirrors** (SPEC S14) — `connect --proxy-dir DIR [--proxy-count N]`
+  exposes N full-duplex PTYs, symlinked into `DIR`, so `screen`, `minicom`, a
+  pyserial script or an AI agent can attach while uart-proxy keeps the real port.
+  Each mirror reads *and* writes, so the default `--proxy-count 2` is 2 readers
+  and 2 writers. Device RX is broadcast to every mirror; concurrent writers are
+  merged **line-atomically** so two commands can never interleave mid-line
+  (`--tx-merge raw` for byte passthrough). `--proxy PATH` (repeatable) puts a
+  mirror at an exact path. POSIX only — Windows has no `pty`; use `--serve`.
+  - A client that stops reading has its backlog dropped past 1 MiB rather than
+    stalling the serial pump or the other mirrors.
+  - Symlinks are removed on exit including `SIGTERM`; a stale link left by a
+    `kill -9` is replaced at startup, while a *non*-symlink in the way is
+    refused, never deleted.
+  - Mirror TX goes through `session.write`, so it appears in the TUI and the logs
+    as ordinary TX.
+- **Exclusive claim on the physical port** (SPEC S15) — `connect` now issues
+  `TIOCEXCL`, so a second program opening the same device fails with `EBUSY`
+  instead of silently splitting the byte stream with us. `--no-exclusive` opts
+  out; `UartSource.is_exclusive` reports what was obtained.
+
+### Fixed
+- **The README overstated OS-level exclusivity.** A serial port is *not*
+  exclusive by default on macOS/Linux — two processes can both open one and split
+  the stream, with nothing reporting it (`screen` neither sets `TIOCEXCL` nor
+  takes a lock file, and pyserial's `exclusive=True` is only an advisory `flock`
+  that `screen` ignores). Windows COM ports *are* exclusive. The docs now say so,
+  and the new claim makes the guarantee real on POSIX too.
+
 ## [1.20260612.1215230] — 2026-06-12
 
 Initial public release. A cross-platform UART log reader / controller

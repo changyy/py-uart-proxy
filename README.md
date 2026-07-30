@@ -34,6 +34,14 @@ viewer, recorder, proxy, plugins, and UI on top of it.
 | 6 | Connect to a **local UART** or a **remote socket** | ✅ `connect` / `remote` |
 | 7 | Plugin architecture for pattern watching (grep-style) | ✅ `--grep`, `--plugin-dir`, `Plugin` API |
 
+Beyond the original seven:
+
+- **Exclusive port claim** — nothing else on this machine can open the wire behind
+  your back and silently steal half the bytes (`--no-exclusive` opts out).
+- **Local PTY mirrors** — deliberately share the one port with `screen`,
+  `minicom`, pyserial or an AI agent: `--proxy-dir DIR --proxy-count 2` gives 2
+  full-duplex mirrors (POSIX).
+
 ---
 
 ## Install
@@ -285,16 +293,69 @@ The wire protocol is specified in [PROTOCOL.md](./PROTOCOL.md).
 
 A read-only client (`--auth 000000`) can watch the stream but cannot send.
 
-> **Why the proxy matters — UART is exclusive-open.** A serial port can only be
-> held by **one** process at a time (the OS gives it exclusive access; pyserial
-> and `screen` both lock it). If `screen -U /dev/tty.usbserial-120 115200` is
-> running, `uart-proxy` cannot open the same port, and vice-versa. There is no
-> OS-level "multiple readers" for a raw UART — bytes are delivered once. To let
-> several people watch (and optionally one control), make **uart-proxy the
-> single owner** (`--serve`) and have everyone else attach via the proxy with a
-> `readonly` (or `full`) auth code. That is the supported multi-viewer model.
+> **Why sharing needs a proxy — a UART delivers each byte once.** There is no
+> OS-level "multiple readers" for a raw serial port: whoever reads a byte first
+> consumes it. On **Windows** a COM port is exclusive-open, so a second program
+> simply gets "access denied". On **macOS/Linux it is not** — two processes can
+> both open `/dev/tty.usbserial-120` and will then split the stream between them
+> at random, with nothing reporting the problem. (`screen` neither sets
+> `TIOCEXCL` nor takes a lock file; pyserial's `exclusive=True` takes an
+> advisory `flock`, which `screen` ignores.)
+>
+> So uart-proxy claims the port itself with `TIOCEXCL` — after that a second
+> `screen` on the real device fails cleanly with `Resource busy`. Sharing then
+> happens **on purpose**, one of two ways: over the network with `--serve`
+> (below), or with other tools on this machine via **PTY mirrors** (next
+> section). Use `--no-exclusive` if you really want the old free-for-all.
 
-### 6. Plugins (pattern watching)
+### 6. Share the port with local tools (PTY mirrors)
+
+`--serve` is for other *machines*. To share with other *programs on this box* —
+`screen`, `minicom`, a pyserial script, an AI agent — expose **PTY mirrors**:
+
+```bash
+uart-proxy connect --port /dev/cu.usbserial-110 --baud 115200 \
+    --proxy-dir /tmp/uart-proxy --proxy-count 2
+```
+
+```
+Sharing /dev/cu.usbserial-110 via 2 PTY mirror(s), tx-merge=line:
+  /tmp/uart-proxy/usbserial-110-0 -> /dev/ttys004
+  /tmp/uart-proxy/usbserial-110-1 -> /dev/ttys005
+```
+
+Each mirror is a real, full-duplex serial device — **`--proxy-count 2` gives you
+2 readers *and* 2 writers**. Anything that opens a serial port can attach:
+
+```bash
+screen /tmp/uart-proxy/usbserial-110-1        # a human watching & typing
+python -c "import serial; s=serial.Serial('/tmp/uart-proxy/usbserial-110-0')"
+```
+
+- **Everyone sees everything the device says** — RX is broadcast to every mirror.
+- **Anyone may type.** Concurrent writers are merged **line-atomically** by
+  default: your bytes are held until you finish the line, then the whole line
+  goes out in one write, so two people typing at once can never turn `reboot` +
+  `whoami` into `rebwhooot`. Use `--tx-merge raw` for byte-for-byte passthrough
+  if latency matters more than that.
+- A mirror shows **device output only**, not what another mirror typed. Real
+  consoles echo, so you still see the other person's command come back — and
+  staying transparent is what lets an unmodified `screen` work.
+- A client that stops reading gets its backlog dropped (past 1 MiB) rather than
+  stalling everyone else.
+- Symlinks are cleaned up on exit, including `SIGTERM`; a stale one from a
+  `kill -9` is replaced on the next start.
+
+Give an exact path instead of a directory with `--proxy PATH` (repeatable).
+
+> **What this can't do.** A UART is one unframed byte stream, so nothing at this
+> layer can tell you which reply belongs to which writer. Line-atomic merge keeps
+> each *command* intact; correlating *responses* is up to you. If you need real
+> per-client request/response, use the socket proxy protocol instead.
+>
+> POSIX only — Windows has no `pty`. Use `--serve` there.
+
+### 7. Plugins (pattern watching)
 
 Quick grep:
 
@@ -333,6 +394,7 @@ py-uart-proxy/
   ROADMAP.md           ← action items / status
   src/uart_proxy/
     core/    timestamp · events · bus · line_assembler · recorder · session
+             retention · pty_proxy (local PTY mirrors)
     io/      source (ABC) · uart_source · socket_source
     proxy/   protocol (JSON-lines + auth/roles) · server
     plugins/ base · manager · builtin/grep

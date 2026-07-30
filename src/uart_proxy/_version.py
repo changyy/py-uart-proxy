@@ -9,4 +9,4 @@ This is the ONE place the version is defined. It is consumed by:
 so the toml and the code can never drift apart.
 """
 
-__version__ = "1.20260612.1215230"
+__version__ = "1.20260730.1220937"
