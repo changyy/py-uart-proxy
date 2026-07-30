@@ -32,11 +32,18 @@ accident.
 
 ### Fixed
 - **The README overstated OS-level exclusivity.** A serial port is *not*
-  exclusive by default on macOS/Linux — two processes can both open one and split
-  the stream, with nothing reporting it (`screen` neither sets `TIOCEXCL` nor
-  takes a lock file, and pyserial's `exclusive=True` is only an advisory `flock`
-  that `screen` ignores). Windows COM ports *are* exclusive. The docs now say so,
-  and the new claim makes the guarantee real on POSIX too.
+  exclusive by default on POSIX — a second `open()` of the same node succeeds and
+  the two processes then split the stream, with nothing reporting it. Windows COM
+  ports *are* exclusive. SPEC S15 now carries the behaviour measured on macOS 15,
+  including the detail that matters for `--port`: `UartSource` opens the `tty.*`
+  node (`PortIdentity.tty_device` rewrites `cu.*`), and with the claim taken
+  **both** nodes of the pair return `EBUSY` to everyone else.
+- Two claims in those docs were wrong and are corrected: **`screen` does claim
+  the line** (measured — a second open while it holds an otherwise-shareable node
+  gives `EBUSY`), and the `cu.*`/`tty.*` **dialin/callout interlock already
+  refuses the cross-node case** without any claim. So `TIOCEXCL` is not what stops
+  `screen`; what it closes is the *same-node* hole — a second `uart-proxy`, a
+  `pyserial` script, `cat /dev/tty.X`.
 
 ## [1.20260612.1215230] — 2026-06-12
 

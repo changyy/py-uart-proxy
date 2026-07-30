@@ -274,15 +274,34 @@ symlinked into a directory, that any serial-capable tool can open.
   port object) is logged and the session continues. `UartSource.is_exclusive`
   reports what was actually obtained.
 - This is deliberately **not** pyserial's `exclusive=True`, which takes an
-  advisory `flock` — `screen` does not `flock`, so that would not stop it.
+  advisory `flock` — that only stops programs which also `flock`.
+
+**Measured POSIX behaviour** (macOS 15, `open(2)` on a serial node, `O_NONBLOCK`),
+which is what the claim is for. Note `UartSource` opens the **`tty.*`** node —
+`PortIdentity.tty_device` rewrites a `cu.*` argument — so the first row is ours:
+
+| holder | 2nd open, same node | open of the paired node |
+|--------|---------------------|-------------------------|
+| `tty.X`, no claim | **succeeds** — streams silently split | `cu.X` → `EBUSY` |
+| `tty.X` + `TIOCEXCL` | `EBUSY` | `cu.X` → `EBUSY` |
+| `cu.X`, no claim | **succeeds** | `tty.X` → `EBUSY` |
+| `cu.X` + `TIOCEXCL` | `EBUSY` | — |
+
+So the dialin/callout interlock already covers the *cross*-node case for free;
+`TIOCEXCL` is what closes the **same-node** hole (a second `uart-proxy`, a
+`pyserial` script, `cat /dev/tty.X`). `screen` and `minicom` claim the line
+themselves and were never the threat; unclaimed readers are.
 
 **Acceptance**
 - `seize_exclusive` returns True for a tty fd and False (no raise) for a pipe.
 - `UartSource.open()` claims the port's own fd by default; `exclusive=False`
   claims nothing; `close()` clears `is_exclusive`.
 - An unreachable port object leaves `open()` working and `is_exclusive` False.
-- **Manual (needs hardware)** — the pty driver ignores `TIOCEXCL`, so kernel
-  enforcement cannot be tested in CI. With a real adapter attached:
-  `uart-proxy connect --port /dev/cu.usbserial-110`, then in another terminal
-  `screen /dev/cu.usbserial-110` must fail with `Resource busy` (errno 16),
-  while `screen /tmp/uart-proxy/usbserial-110-0` attaches.
+- **Not coverable in CI** — the pty driver ignores `TIOCEXCL` (the ioctl
+  succeeds, a second open still works), so kernel enforcement needs a real tty.
+  Verified by hand on macOS 15 against a PL2303 adapter and a spare
+  `Bluetooth-Incoming-Port` node, producing the table above. To re-check after a
+  macOS or driver update: `uart-proxy connect --port /dev/cu.usbserial-110`, then
+  `python3 -c "import serial; serial.Serial('/dev/cu.usbserial-110')"` must raise
+  `Resource busy` (errno 16) while `screen /tmp/uart-proxy/usbserial-110-0`
+  attaches.

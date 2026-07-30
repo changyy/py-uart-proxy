@@ -121,10 +121,16 @@ also the only writer to the wire, a whole line is inherently indivisible in
 ### Exclusive claim on the wire
 
 Sharing must be deliberate, so `UartSource` claims the port with `TIOCEXCL`
-(default; `--no-exclusive` opts out). This matters most on macOS/Linux, where the
-tty layer would otherwise let a second process open the same device and split the
-byte stream with us — silently. `TIOCEXCL` is kernel-enforced, unlike pyserial's
-`exclusive=True` (an advisory `flock` that `screen` ignores) — see SPEC S15.
+(default; `--no-exclusive` opts out). This matters on POSIX, where the tty layer
+otherwise lets a second process open the same node and split the byte stream with
+us — silently, which is worse than an error. `TIOCEXCL` is kernel-enforced,
+unlike pyserial's `exclusive=True` (an advisory `flock`). SPEC S15 tabulates the
+measured open/`EBUSY` behaviour and which case the claim actually closes.
+
+Note `UartSource` opens the **`tty.*`** node on macOS: `PortIdentity.tty_device`
+rewrites a `/dev/cu.*` argument, so `--port /dev/cu.usbserial-110` really opens
+`/dev/tty.usbserial-110` — the banner prints the path actually used. With the
+claim taken, both nodes of the pair return `EBUSY` to everyone else.
 
 ## Proxy protocol (summary)
 

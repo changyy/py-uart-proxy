@@ -296,17 +296,25 @@ A read-only client (`--auth 000000`) can watch the stream but cannot send.
 > **Why sharing needs a proxy — a UART delivers each byte once.** There is no
 > OS-level "multiple readers" for a raw serial port: whoever reads a byte first
 > consumes it. On **Windows** a COM port is exclusive-open, so a second program
-> simply gets "access denied". On **macOS/Linux it is not** — two processes can
-> both open `/dev/tty.usbserial-120` and will then split the stream between them
-> at random, with nothing reporting the problem. (`screen` neither sets
-> `TIOCEXCL` nor takes a lock file; pyserial's `exclusive=True` takes an
-> advisory `flock`, which `screen` ignores.)
+> simply gets "access denied". On **POSIX a second open is not refused by
+> default** — both processes succeed and then split the stream between them at
+> random, with nothing reporting the problem.
 >
-> So uart-proxy claims the port itself with `TIOCEXCL` — after that a second
-> `screen` on the real device fails cleanly with `Resource busy`. Sharing then
-> happens **on purpose**, one of two ways: over the network with `--serve`
-> (below), or with other tools on this machine via **PTY mirrors** (next
-> section). Use `--no-exclusive` if you really want the old free-for-all.
+> Measured on macOS 15 (`open(2)` on a USB-serial node, no claim taken): a second
+> open of the *same* node **succeeds**. What is refused is the *other* node of the
+> pair — holding `/dev/tty.X` makes `/dev/cu.X` return `EBUSY` and vice-versa
+> (the classic dialin/callout interlock). Tools that claim the line — `screen`
+> does, despite its reputation; `minicom` also writes a lock file — are protected;
+> a plain `pyserial` script or `cat` is not, in either direction.
+>
+> So uart-proxy claims the port itself with `TIOCEXCL`, which closes the
+> same-node hole: with it, **both** nodes return `Resource busy` to everyone else
+> (verified). Sharing then happens **on purpose**, one of two ways: over the
+> network with `--serve` (below), or with other tools on this machine via **PTY
+> mirrors** (next section). Use `--no-exclusive` for the old free-for-all.
+>
+> Note pyserial's own `exclusive=True` is *not* this: it takes an advisory
+> `flock`, which only stops other programs that also `flock`.
 
 ### 6. Share the port with local tools (PTY mirrors)
 

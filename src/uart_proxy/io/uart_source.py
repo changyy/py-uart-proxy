@@ -30,14 +30,15 @@ def seize_exclusive(fd: int) -> bool:
     """Claim an open tty ``fd`` exclusively, so no one else can open the device.
 
     Issues ``TIOCEXCL``, which is **kernel-enforced**: every later ``open()`` of
-    that device path fails with ``EBUSY`` until we close it. That is what makes
-    ``screen /dev/cu.usbserial-110`` refuse to start while uart-proxy holds the
-    port, instead of both processes silently splitting the byte stream between
-    them — which is worse than an error, because nothing reports it.
+    that device path fails with ``EBUSY`` until we close it. Without it a second
+    open of the same node *succeeds* on POSIX, and the two processes then split
+    the byte stream between them — worse than an error, because nothing reports
+    it. Measured behaviour, and which case this actually closes, is tabulated in
+    SPEC S15.
 
     Note this is *not* what pyserial's ``exclusive=True`` does: that takes an
     ``flock``, which is advisory and only blocks other programs that also
-    ``flock``. ``screen`` does not, so ``flock`` alone would not stop it.
+    ``flock``.
 
     Returns True if the claim was made. Best-effort by design: Windows COM ports
     are already exclusive at the OS level, and a non-tty fd (a pipe in a test)
