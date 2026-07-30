@@ -273,6 +273,13 @@ symlinked into a directory, that any serial-capable tool can open.
   failure to claim (odd platform, non-tty, a future `uart_helper` that hides its
   port object) is logged and the session continues. `UartSource.is_exclusive`
   reports what was actually obtained.
+- **The outcome is announced.** Because the claim is best-effort, and because it
+  happens on the session's connection thread *after* the CLI has printed its
+  banner, `connect` emits a NOTICE once connected saying which of the three
+  things happened — claimed / could not claim / opted out with
+  `--no-exclusive`. Silence would let a failed claim pass for a protected wire.
+  It re-reports only when the answer changes, so a flapping device doesn't fill
+  the log with one line.
 - This is deliberately **not** pyserial's `exclusive=True`, which takes an
   advisory `flock` — that only stops programs which also `flock`.
 
@@ -297,6 +304,11 @@ themselves and were never the threat; unclaimed readers are.
 - `UartSource.open()` claims the port's own fd by default; `exclusive=False`
   claims nothing; `close()` clears `is_exclusive`.
 - An unreachable port object leaves `open()` working and `is_exclusive` False.
+- On `connected`, exactly one NOTICE names the outcome: a claim says
+  `claimed <path> (TIOCEXCL)`; a failed claim says `COULD NOT claim`;
+  `--no-exclusive` says so instead of reporting a failure. Nothing is said on
+  `waiting` / `reconnecting` / `error`. Five `connected` events in a row produce
+  one notice; a changed outcome produces a second.
 - **Not coverable in CI** — the pty driver ignores `TIOCEXCL` (the ioctl
   succeeds, a second open still works), so kernel enforcement needs a real tty.
   Verified by hand on macOS 15 against a PL2303 adapter and a spare

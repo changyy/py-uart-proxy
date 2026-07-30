@@ -11,11 +11,18 @@ failing to get one never breaks the session.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
+from uart_proxy.cli import attach_exclusivity_report
+from uart_proxy.core.events import Direction, Event, EventKind
+from uart_proxy.core.session import UartSession
+from uart_proxy.core.timestamp import TimestampTracker
 from uart_proxy.io import uart_source as mod
 from uart_proxy.io.uart_source import UartSource, seize_exclusive
+
+from conftest import FakeSource
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="POSIX ioctl behaviour")
 
@@ -127,3 +134,64 @@ def test_an_unreachable_fd_does_not_break_open(monkeypatch, pty_fd):
     source.open()  # must not raise
     assert calls == []
     assert source.is_exclusive is False
+
+
+# ── the claim is reported, so a silent failure can't be mistaken for safety ──
+
+
+def _connected(text: str = "connected") -> Event:
+    return Event(EventKind.STATUS, Direction.SYS, TimestampTracker().stamp(), text=text)
+
+
+def _reporter(*, is_exclusive: bool, requested: bool = True):
+    """A session with the reporter attached; returns (session, notices)."""
+    session = UartSession(FakeSource(), auto_reconnect=False)
+    source = SimpleNamespace(is_exclusive=is_exclusive, device_path="/dev/tty.fake")
+    notices: list[str] = []
+    session.bus.subscribe(
+        lambda e: notices.append(e.text) if e.kind is EventKind.NOTICE else None
+    )
+    attach_exclusivity_report(session, source, requested=requested)
+    return session, source, notices
+
+
+def test_a_successful_claim_is_announced():
+    session, _, notices = _reporter(is_exclusive=True)
+    session.bus.publish(_connected())
+    assert len(notices) == 1
+    assert "claimed /dev/tty.fake" in notices[0] and "TIOCEXCL" in notices[0]
+
+
+def test_a_failed_claim_is_announced_loudly():
+    """The claim is best-effort; failing silently would leave the operator
+    believing the wire is protected when it isn't."""
+    session, _, notices = _reporter(is_exclusive=False, requested=True)
+    session.bus.publish(_connected())
+    assert len(notices) == 1
+    assert "COULD NOT claim" in notices[0] and "split the byte stream" in notices[0]
+
+
+def test_opting_out_is_reported_as_a_choice_not_a_failure():
+    session, _, notices = _reporter(is_exclusive=False, requested=False)
+    session.bus.publish(_connected())
+    assert len(notices) == 1
+    assert "--no-exclusive" in notices[0] and "COULD NOT" not in notices[0]
+
+
+def test_nothing_is_said_before_the_port_opens():
+    session, _, notices = _reporter(is_exclusive=True)
+    for state in ("waiting", "reconnecting", "error"):
+        session.bus.publish(_connected(state))
+    assert notices == []
+
+
+def test_a_flapping_device_does_not_repeat_the_same_line():
+    session, source, notices = _reporter(is_exclusive=True)
+    for _ in range(5):
+        session.bus.publish(_connected())
+    assert len(notices) == 1, "reconnects must not fill the log with one line"
+
+    # …but a genuine change of state is worth saying.
+    source.is_exclusive = False
+    session.bus.publish(_connected())
+    assert len(notices) == 2 and "COULD NOT claim" in notices[1]

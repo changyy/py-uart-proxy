@@ -313,6 +313,17 @@ A read-only client (`--auth 000000`) can watch the stream but cannot send.
 > network with `--serve` (below), or with other tools on this machine via **PTY
 > mirrors** (next section). Use `--no-exclusive` for the old free-for-all.
 >
+> You don't have to take that on trust — the claim is best-effort, so `connect`
+> says which way it went as soon as it is connected:
+>
+> ```
+> * exclusive: claimed /dev/tty.usbserial-110 (TIOCEXCL) — another program
+>   opening it now gets EBUSY
+> ```
+>
+> …or `COULD NOT claim …` if the ioctl was refused, or `not claimed
+> (--no-exclusive)` if you asked for that.
+>
 > Note pyserial's own `exclusive=True` is *not* this: it takes an advisory
 > `flock`, which only stops other programs that also `flock`.
 

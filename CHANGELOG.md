@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.20260730.1220937] — 2026-07-30
+## [1.20260731.1004202] — 2026-07-31
 
 Share one physical UART with several local tools — and stop anyone taking it by
 accident.
@@ -29,6 +29,11 @@ accident.
   `TIOCEXCL`, so a second program opening the same device fails with `EBUSY`
   instead of silently splitting the byte stream with us. `--no-exclusive` opts
   out; `UartSource.is_exclusive` reports what was obtained.
+  - The outcome is **announced** as a notice once connected — claimed / could not
+    claim / opted out. The claim is best-effort and happens on the connection
+    thread after the banner is printed, so staying quiet would let a failed claim
+    pass for a protected wire. Re-reported only when the answer changes, so a
+    flapping device doesn't repeat it.
 
 ### Fixed
 - **The README overstated OS-level exclusivity.** A serial port is *not*

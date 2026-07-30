@@ -29,6 +29,7 @@ from typing import Optional
 from uart_helper import SerialMonitor, UARTConfig
 
 from . import __version__
+from .core.events import EventKind
 from .core.pty_proxy import (
     DEFAULT_PROXY_COUNT,
     DEFAULT_PROXY_DIR,
@@ -265,6 +266,49 @@ def _maybe_build_proxy(session: UartSession, args: argparse.Namespace) -> Option
     return ProxyServer(session, auth, host=args.listen, port=args.listen_port)
 
 
+def attach_exclusivity_report(
+    session: UartSession, source: UartSource, *, requested: bool
+) -> None:
+    """Say, once connected, whether the port really was claimed exclusively.
+
+    The claim happens inside ``source.open()`` on the session's own connection
+    thread, so the result is not known when the CLI prints its banner. And the
+    claim is best-effort by design (SPEC S15) — a silent failure would leave the
+    operator believing the wire is protected when it isn't, so it gets said out
+    loud, as a NOTICE that both the TUI and the headless stream already render.
+
+    Re-reports only when the answer *changes*, so a flapping device reconnecting
+    every second doesn't fill the log with the same line.
+    """
+    last: list[bool] = []
+
+    def on_event(event) -> None:
+        if event.kind is not EventKind.STATUS or event.text != "connected":
+            return
+        claimed = bool(getattr(source, "is_exclusive", False))
+        if last and last[-1] == claimed:
+            return
+        last.append(claimed)
+        path = getattr(source, "device_path", "the port")
+        if claimed:
+            session.publish_notice(
+                f"exclusive: claimed {path} (TIOCEXCL) — "
+                f"another program opening it now gets EBUSY"
+            )
+        elif requested:
+            session.publish_notice(
+                f"exclusive: COULD NOT claim {path} — another program can open "
+                f"it and silently split the byte stream with us"
+            )
+        else:
+            session.publish_notice(
+                f"exclusive: not claimed (--no-exclusive) — another program can "
+                f"open {path} and silently split the byte stream with us"
+            )
+
+    session.bus.subscribe(on_event)
+
+
 def _maybe_build_pty_proxy(
     session: UartSession, args: argparse.Namespace
 ) -> Optional[PtyProxyGroup]:
@@ -419,6 +463,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
         auto_reconnect=not args.no_reconnect,
         reconnect_interval=args.reconnect_interval,
     )
+    attach_exclusivity_report(session, source, requested=not args.no_exclusive)
     return _run_session(session, args, title=f"uart-proxy · {args.port}")
 
 
