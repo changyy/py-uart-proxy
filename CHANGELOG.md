@@ -21,6 +21,10 @@ accident.
     refused, never deleted.
   - Mirror TX goes through `session.write`, so it appears in the TUI and the logs
     as ordinary TX.
+  - [`examples/check_pty_mirrors.py`](./examples/check_pty_mirrors.py) checks all
+    of the above against the **real CLI** with no hardware (a PTY pair stands in
+    for the adapter), reporting each guarantee separately and exiting non-zero on
+    failure, so it works as a smoke test as well as a demonstration.
 - **Exclusive claim on the physical port** (SPEC S15) — `connect` now issues
   `TIOCEXCL`, so a second program opening the same device fails with `EBUSY`
   instead of silently splitting the byte stream with us. `--no-exclusive` opts

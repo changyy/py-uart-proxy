@@ -257,6 +257,10 @@ symlinked into a directory, that any serial-capable tool can open.
   serving; a later write succeeds.
 - A dangling symlink at a mirror path is replaced; a regular file there raises
   `FileExistsError` and is left intact.
+- End to end, against the real CLI and needing no hardware:
+  `python examples/check_pty_mirrors.py` exits 0 (a PTY pair stands in for the
+  adapter; it also covers the startup banner, the `-0`/`-1` naming, and SIGTERM
+  cleanup, which the unit tests reach only from the inside).
 
 ## S15. Exclusive claim on the physical port
 

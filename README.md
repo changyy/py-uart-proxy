@@ -348,6 +348,22 @@ python -c "import serial; s=serial.Serial('/tmp/uart-proxy/usbserial-110-0')"
 
 Give an exact path instead of a directory with `--proxy PATH` (repeatable).
 
+**No adapter to hand?** [`examples/check_pty_mirrors.py`](./examples/check_pty_mirrors.py)
+runs the whole thing against a PTY pair standing in for the device, and reports
+each guarantee separately — useful both as a smoke test and as a readable
+demonstration of what sharing actually looks like:
+
+```console
+$ python examples/check_pty_mirrors.py
+  ✓ 2 mirrors announced and symlinked
+  ✓ device RX is broadcast to every mirror
+  ✓ a mirror's TX reaches the device
+  ✓ a partial line is held back
+  ✓ both commands arrive intact (line-atomic merge)
+  ✓ the device's reply is visible to both mirrors
+  ✓ SIGTERM removes the symlinks
+```
+
 > **What this can't do.** A UART is one unframed byte stream, so nothing at this
 > layer can tell you which reply belongs to which writer. Line-atomic merge keeps
 > each *command* intact; correlating *responses* is up to you. If you need real
@@ -401,6 +417,7 @@ py-uart-proxy/
     ui/      tui (Textual) · headless
     cli.py
   plugins/   example user plugin
+  examples/  uart_helper_broker.py · check_pty_mirrors.py
   tests/
 ```
 
