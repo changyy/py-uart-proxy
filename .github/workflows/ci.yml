@@ -29,4 +29,6 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Run tests
-        run: python -m pytest -q
+        # -ra so a failure names itself in the log summary; --durations to make a
+        # test that hung on a timeout obvious rather than something to guess at.
+        run: python -m pytest -q -ra --durations=10

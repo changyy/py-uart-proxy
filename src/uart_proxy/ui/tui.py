@@ -9,11 +9,23 @@ Layout (top to bottom):
     Input           type here, Enter sends (with the configured line ending)
     Footer          key bindings
 
-Key bindings:
-    ctrl+t   cycle timestamp display (none → relative → full)
-    ctrl+y   toggle hex view
-    ctrl+k   clear the log
-    ctrl+q   quit
+Input has two modes, because a serial console needs both:
+
+* **line** (default) — type a command, press Enter. Comfortable, with editing.
+* **character** — every keystroke goes straight to the device, so ``^C``
+  interrupts, Tab completes and ↑ reaches the shell's history. This is what a
+  serial terminal normally does.
+
+Character mode can only work if *every* key reaches the app, so it moves focus off
+the Input widget (a focused Input swallows printable keys) and ``check_action``
+stands the app's own ``Ctrl+…`` bindings down. That leaves one key reserved: the
+**command prefix**, ``Ctrl+]`` by default (see :mod:`uart_proxy.ui.keymap` for why
+that one). ``<prefix> ?`` lists the commands; ``<prefix> <prefix>`` sends the
+literal byte.
+
+Direct bindings (``Ctrl+T`` timestamps, ``Ctrl+Y`` hex, ``Ctrl+K`` clear,
+``Ctrl+W`` copy, ``Ctrl+E`` select, ``Ctrl+Q`` quit) still work in line mode,
+where they cannot conflict with anything.
 
 The session runs its read loop on a background thread; bus events are marshalled
 onto the Textual event loop with ``call_from_thread``.
@@ -31,6 +43,7 @@ from .. import __version__
 from ..core.events import Direction, Event, EventKind
 from ..core.session import UartSession
 from ..core.timestamp import format_elapsed
+from .keymap import DEFAULT_PREFIX, key_to_bytes, prefix_label
 
 try:
     from textual.app import App, ComposeResult
@@ -135,11 +148,27 @@ if _TEXTUAL_AVAILABLE:
             title: str = "uart-proxy",
             ts_mode: str = "relative",
             log_hint: Optional[str] = None,
+            history: Optional[list] = None,
+            prefix: str = DEFAULT_PREFIX,
+            input_mode: str = "line",
+            detachable: bool = False,
         ) -> None:
             super().__init__()
             self.session = session
             self._title = title
             self._log_hint = log_hint
+            # The one reserved key. Everything else can then be given to the
+            # device in character mode (see _handle_char_key).
+            self._prefix = prefix
+            self._prefix_label = prefix_label(prefix)
+            self._awaiting_command = False
+            self._char_mode = input_mode == "char"
+            # Only a background session can be left running behind us.
+            self._detachable = detachable
+            self._detached = False
+            # Replayed history to show above the live tail, if we attached to a
+            # session that had already been running.
+            self._history = history or []
             self._ts_index = _TS_MODES.index(ts_mode) if ts_mode in _TS_MODES else 1
             self._hex = False
             self._select_mode = False
@@ -174,21 +203,59 @@ if _TEXTUAL_AVAILABLE:
             self.title = self._title
             self.sub_title = f"v{__version__}"
             self._log = self.query_one("#log", FollowLog)
+            # History first, so it sits above the live tail in the right order.
+            self._write_history()
             # Subscribe BEFORE start() so the "connected" status is captured.
             self._unsubscribe = self.session.bus.subscribe(self._enqueue_event)
             # Drain the cross-thread queue and refresh the status on timers.
             self.set_interval(0.05, self._drain_events)
             self.set_interval(0.25, self._refresh_status)
-            # Make sure typing goes to the input box, not the scroll log.
-            if self.session.source.writable:
-                self.query_one("#cmd", Input).focus()
-            else:
+            # Make sure typing goes where the current mode needs it: the input
+            # box in line mode, the log in character mode (a focused Input eats
+            # printable keys before on_key ever sees them).
+            if self._char_mode or not self.session.source.writable:
+                self.query_one("#cmd", Input).disabled = True
                 self._log.focus()
+            else:
+                self.query_one("#cmd", Input).focus()
+            self._note(f"{self._prefix_label} is the command prefix "
+                       f"({self._prefix_label} ? for the list)")
             try:
                 self.session.start()
             except Exception as exc:  # noqa: BLE001
                 self._log.write(f"[red]Failed to open source: {exc}[/red]")
             self._refresh_status()
+
+        def _write_history(self) -> None:
+            """Show replayed lines dimmed, between two dividers.
+
+            A serial console is often quiet, so without this an attach looks
+            identical to a broken one. The stamps are the server's, from when
+            each line actually arrived — anything else would be history claiming
+            to have happened at the moment you attached.
+            """
+            if self._log is None or not self._history:
+                return
+            from ..core.replay import describe
+
+            header = f"── replayed {describe(self._history)} ──"
+            self._log.write(f"[dim]{self._escape(header)}[/dim]")
+            self._copy_lines.append(header)
+            for entry in self._history:
+                prefix = self._history_prefix(entry)
+                plain = f"{prefix}< {entry.text}"
+                self._log.write(f"[dim]{self._escape(plain)}[/dim]")
+                self._copy_lines.append(plain)
+            self._log.write("[dim]── live ──[/dim]")
+            self._copy_lines.append("── live ──")
+
+        def _history_prefix(self, entry) -> str:
+            mode = _TS_MODES[self._ts_index]
+            if mode == "full":
+                return f"{entry.wall} | {format_elapsed(entry.elapsed)} "
+            if mode == "relative":
+                return f"{format_elapsed(entry.elapsed)} "
+            return ""
 
         def on_unmount(self) -> None:
             if self._unsubscribe is not None:
@@ -272,6 +339,12 @@ if _TEXTUAL_AVAILABLE:
             else:
                 follow = "[yellow]paused ▲[/yellow]"
             rec = f" · rec→{self._escape(self._log_hint)}" if self._log_hint else " · rec off"
+            if self._awaiting_command:
+                mode = f"[black on yellow] {self._prefix_label} … [/]"
+            elif self._char_mode:
+                mode = f"[cyan]char[/cyan] ({self._prefix_label} c)"
+            else:
+                mode = f"line ({self._prefix_label} c)"
             if self.session.is_connected:
                 state = "[green]● live[/green]"
             elif self.session.is_running:
@@ -283,6 +356,7 @@ if _TEXTUAL_AVAILABLE:
                 f" · elapsed {format_elapsed(stamp.elapsed)}"
                 f" · rx {self.session.rx_bytes}B tx {self.session.tx_bytes}B"
                 f" · ts={_TS_MODES[self._ts_index]} hex={'on' if self._hex else 'off'}"
+                f" · {mode}"
                 f" · {follow}{rec}"
             )
 
@@ -383,6 +457,156 @@ if _TEXTUAL_AVAILABLE:
             except Exception:  # noqa: BLE001 - never let a driver quirk crash the UI
                 pass
 
+        # ── keys ────────────────────────────────────────────────────────────
+
+        #: Bindings that must get out of the way in character mode, because the
+        #: keys belong to the device then. Reachable via the prefix either way.
+        _MODAL_ACTIONS = frozenset({
+            "toggle_select", "cycle_ts", "toggle_hex", "clear_log", "copy_all",
+        })
+
+        def check_action(self, action: str, parameters) -> bool:
+            """Disable the direct Ctrl+… bindings while in character mode.
+
+            They are `priority=True`, so without this they would be swallowed by
+            the app before `on_key` ever ran — and stealing `Ctrl+W` from a shell
+            is exactly the problem character mode exists to fix. Returning False
+            lets the key fall through to the device; the same commands stay
+            available as `<prefix> w` and friends.
+            """
+            if self._char_mode and action in self._MODAL_ACTIONS:
+                return False
+            return True
+
+        def on_key(self, event) -> None:
+            """The command prefix, and character mode.
+
+            Character mode can only work if *every* key reaches here, which is
+            why it moves focus off the Input widget — a focused Input swallows
+            printable keys (they belong in the box) and they never bubble up.
+            """
+            if self._awaiting_command:
+                event.stop()
+                event.prevent_default()
+                self._awaiting_command = False
+                self._run_command(event)
+                self._restore_focus()
+                return
+
+            if event.key == self._prefix:
+                event.stop()
+                event.prevent_default()
+                self._awaiting_command = True
+                # In line mode the Input holds focus and would swallow the
+                # command letter — printable keys go in the box and never bubble
+                # up to here. Park focus on the log for the one keystroke that
+                # follows, then give it back.
+                if self._log is not None:
+                    self._log.focus()
+                self._note(f"{self._prefix_label} — d detach · q quit · c char/line "
+                           f"· t time · y hex · k clear · w copy · ? help")
+                self._refresh_status()
+                return
+
+            if self._char_mode:
+                event.stop()
+                event.prevent_default()
+                self._send_key(event)
+
+        def _restore_focus(self) -> None:
+            """Put focus back where the current mode wants it."""
+            if self._char_mode or self._detached or not self.session.source.writable:
+                return
+            inp = self.query_one("#cmd", Input)
+            if not inp.disabled:
+                inp.focus()
+
+        def _run_command(self, event) -> None:
+            """Handle the key pressed *after* the prefix."""
+            key = event.key
+            if key == self._prefix:          # escape the escape
+                self._send_key(event, literal=True)
+                return
+            command = {
+                "d": self._detach, "q": self._quit,
+                "c": self._toggle_input_mode, "t": self.action_cycle_ts,
+                "y": self.action_toggle_hex, "k": self.action_clear_log,
+                "w": self.action_copy_all, "e": self.action_toggle_select,
+                "question_mark": self._show_help, "?": self._show_help,
+            }.get(key)
+            if command is None:
+                self._note(f"{self._prefix_label} {key}: unknown — "
+                           f"{self._prefix_label} ? for the list")
+                return
+            command()
+
+        def _send_key(self, event, *, literal: bool = False) -> None:
+            """Put one keystroke on the wire, if it has bytes to send."""
+            if not self.session.source.writable:
+                return
+            data = key_to_bytes(
+                event.key, event.character,
+                eol=self.session.default_eol or b"\r",
+                encoding=self.session.encoding,
+            )
+            if not data:
+                return
+            try:
+                self.session.write(data)
+            except Exception as exc:  # noqa: BLE001
+                self._note(f"send failed: {exc}")
+
+        def _toggle_input_mode(self) -> None:
+            self._char_mode = not self._char_mode
+            inp = self.query_one("#cmd", Input)
+            if self._char_mode:
+                # Focus has to leave the Input for printable keys to reach on_key.
+                inp.disabled = True
+                if self._log is not None:
+                    self._log.focus()
+                self._note("character mode — every key goes straight to the "
+                           f"device, including ^C. {self._prefix_label} c to go back")
+            else:
+                inp.disabled = not self.session.source.writable
+                inp.placeholder = "Type and press Enter to send…"
+                if not inp.disabled:
+                    inp.focus()
+                self._note("line mode — type a command and press Enter")
+            self._refresh_status()
+
+        def _quit(self) -> None:
+            # exit(), not action_quit(): the latter is a coroutine in Textual and
+            # calling it from a sync handler would quietly do nothing.
+            self.exit()
+
+        def _detach(self) -> None:
+            """Leave the UI but let the session carry on, if there is one to leave."""
+            if not self._detachable:
+                self._note("nothing to detach from — this session runs in this "
+                           "process. Start one with 'uart-proxy start' to be able "
+                           "to leave it running.")
+                return
+            self._detached = True
+            self.exit()
+
+        def _show_help(self) -> None:
+            p = self._prefix_label
+            for line in (
+                f"{p} is the command prefix. Everything else goes to the device.",
+                f"  {p} d   detach (leave a background session running)",
+                f"  {p} q   quit",
+                f"  {p} c   switch character / line input",
+                f"  {p} t   timestamps    {p} y   hex    {p} k   clear",
+                f"  {p} w   copy log      {p} e   select mode",
+                f"  {p} {p.split('+')[-1]}   send a literal {p}",
+            ):
+                self._note(line)
+
+        def _note(self, text: str) -> None:
+            if self._log is not None:
+                self._log.write(f"[yellow]* {self._escape(text)}[/yellow]")
+                self._copy_lines.append(f"* {text}")
+
         def on_input_submitted(self, message: "Input.Submitted") -> None:
             text = message.value
             message.input.value = ""
@@ -401,6 +625,10 @@ def run_tui(
     title: str = "uart-proxy",
     ts_mode: str = "relative",
     log_hint: Optional[str] = None,
+    history: Optional[list] = None,
+    prefix: str = DEFAULT_PREFIX,
+    input_mode: str = "line",
+    detachable: bool = False,
 ) -> None:
     """Launch the Textual TUI. Raises RuntimeError if textual isn't installed."""
     if not _TEXTUAL_AVAILABLE:
@@ -408,4 +636,6 @@ def run_tui(
             "textual is not installed. Install it with:  pip install textual\n"
             "or run with --no-tui for the headless stream view."
         )
-    UartProxyApp(session, title=title, ts_mode=ts_mode, log_hint=log_hint).run()
+    UartProxyApp(session, title=title, ts_mode=ts_mode, log_hint=log_hint,
+                 history=history, prefix=prefix, input_mode=input_mode,
+                 detachable=detachable).run()

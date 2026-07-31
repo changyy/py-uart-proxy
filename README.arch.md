@@ -49,6 +49,11 @@ This document explains how the PC app is put together and why. For usage see
                                                         (uart-proxy remote) (Flutter) pyserial · an AI agent
 ```
 
+`ReplayBuffer` is a third read-only sink: a bounded ring of recent `LINE(RX)`
+**events**, subscribed from session start so an attaching client can be shown what
+it missed. Events, not bytes, because a byte ring loses the `Stamp` — and history
+that appears to have happened the moment you attached is worse than none.
+
 `ProxyServer` and `PtyProxyGroup` are the two **sinks with a way back in**: each
 takes RX off the bus and feeds TX to `session.write`. Neither touches the
 transport, so both work the same whether the session is driving a local UART or a
@@ -117,6 +122,14 @@ its PTY buffer, then its backlog cap, and then its bytes are dropped and counted
 — it cannot stall the serial pump or the other mirrors. Because that one loop is
 also the only writer to the wire, a whole line is inherently indivisible in
 `--tx-merge line` mode; no extra lock is needed for atomicity.
+
+Mirrors are **raw by default**, though: a mirror stands in for a serial port, and
+a serial port does not buffer. Holding bytes to keep concurrent commands atomic
+breaks everything interactive that depends on a keystroke arriving when it was
+typed — `^C`, tab completion, arrow-key history, single-key prompts — so it is
+the opt-in, not the default. Even under `line`, the four signal bytes
+(`^C ^D ^Z ^\`) overtake the buffer, because a signal delivered late does not
+arrive slowly, it interrupts the wrong thing.
 
 ### Exclusive claim on the wire
 

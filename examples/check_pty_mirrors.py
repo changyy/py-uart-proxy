@@ -13,14 +13,16 @@ POSIX.
                                                   │                │
                                               "agent"          "human"
 
-Checks: RX is broadcast to every mirror · a mirror's TX reaches the device ·
-concurrent writers are merged line-atomically (nothing partial leaks to the
-wire) · the device's reply is visible to the mirror that did *not* type · and
-SIGTERM still removes the symlinks.
+Checks, in both merge modes: RX is broadcast to every mirror · a mirror's TX
+reaches the device · the device's reply is visible to the mirror that did *not*
+type · SIGTERM still removes the symlinks. Then per mode — `raw`: a single byte
+and a `^C` cross without waiting for Enter; `line`: concurrent writers never
+splice one command into another, yet a `^C` still overtakes the held buffer.
 
 Run it:
 
-    python examples/check_pty_mirrors.py            # quiet-ish, exit 0 on success
+    python examples/check_pty_mirrors.py            # both modes, exit 0 on success
+    python examples/check_pty_mirrors.py --tx-merge raw
     python examples/check_pty_mirrors.py -v         # show every byte exchanged
 
 Exits non-zero and prints ``FAIL: …`` per failed check, so it can be a CI step.
@@ -116,10 +118,28 @@ def main() -> int:
     ap.add_argument("--proxy-dir", default=None,
                     help="Where the mirror symlinks go (default: a temp dir, "
                          "removed afterwards).")
+    ap.add_argument("--tx-merge", choices=("raw", "line", "both"), default="both",
+                    help="Which merge mode to check (default: both).")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="Print the bytes exchanged at each step.")
     args = ap.parse_args()
 
+    modes = ("raw", "line") if args.tx_merge == "both" else (args.tx_merge,)
+    failures: list[str] = []
+    for merge in modes:
+        print(f"\n{'=' * 60}\n--tx-merge {merge}\n{'=' * 60}")
+        failures += [f"[{merge}] {f}" for f in check_one(args, merge)]
+
+    print()
+    if failures:
+        for failure in failures:
+            print(f"FAIL: {failure}")
+        return 1
+    print("all checks passed")
+    return 0
+
+
+def check_one(args, merge: str) -> list[str]:
     checks = Checks(args.verbose)
     proxy_dir = args.proxy_dir or tempfile.mkdtemp(prefix="uart-proxy-check-")
     owns_dir = args.proxy_dir is None
@@ -133,7 +153,7 @@ def main() -> int:
 
     proc = subprocess.Popen(
         [args.python, "-m", "uart_proxy", "connect", "--port", device,
-         "--no-tui", "--no-log",
+         "--no-tui", "--no-log", "--tx-merge", merge,
          "--proxy-dir", proxy_dir, "--proxy-count", str(_MIRRORS)],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -175,18 +195,37 @@ def main() -> int:
         checks.note(f"wire={on_wire!r}")
         checks.ok("a mirror's TX reaches the device", b"version" in on_wire)
 
-        # 3. two mirrors type at once — commands cross whole, never spliced
-        os.write(agent, b"reb")
-        os.write(human, b"who")
-        time.sleep(_SETTLE)
-        mid = read_for(dev_master, 0.3)
-        checks.ok("a partial line is held back", mid == b"", f"leaked {mid!r}")
-        os.write(agent, b"oot\r")
-        os.write(human, b"ami\r")
-        on_wire = read_for(dev_master)
-        checks.note(f"wire={on_wire!r}")
-        checks.ok("both commands arrive intact (line-atomic merge)",
-                  b"reboot\r" in on_wire and b"whoami\r" in on_wire, repr(on_wire))
+        # 3. mode-specific: is a byte immediate (raw) or held to keep the
+        #    command whole (line)?
+        if merge == "raw":
+            os.write(human, b"a")
+            on_wire = read_for(dev_master, 0.5)
+            checks.note(f"wire={on_wire!r}")
+            checks.ok("a single byte crosses without waiting for Enter",
+                      on_wire == b"a", repr(on_wire))
+            os.write(human, b"\x03")
+            on_wire = read_for(dev_master, 0.5)
+            checks.ok("^C reaches the device immediately",
+                      on_wire == b"\x03", repr(on_wire))
+        else:
+            os.write(agent, b"reb")
+            os.write(human, b"who")
+            time.sleep(_SETTLE)
+            mid = read_for(dev_master, 0.3)
+            checks.ok("a partial line is held back", mid == b"", f"leaked {mid!r}")
+            os.write(agent, b"oot\r")
+            os.write(human, b"ami\r")
+            on_wire = read_for(dev_master)
+            checks.note(f"wire={on_wire!r}")
+            checks.ok("both commands arrive intact (line-atomic merge)",
+                      b"reboot\r" in on_wire and b"whoami\r" in on_wire, repr(on_wire))
+            # …but a signal must still overtake the buffer it is queued behind.
+            os.write(human, b"ls")
+            time.sleep(_SETTLE)
+            os.write(human, b"\x03")
+            on_wire = read_for(dev_master, 0.5)
+            checks.ok("^C is not held by line-merge",
+                      on_wire == b"ls\x03", repr(on_wire))
 
         # 4. the reply is visible to the mirror that did NOT type
         os.write(dev_master, b"\r\nWed Jul 30 2026\r\n")
@@ -220,13 +259,7 @@ def main() -> int:
         print("\n--- uart-proxy stderr ---")
         print("\n".join(stderr_lines))
 
-    print()
-    if checks.failures:
-        for failure in checks.failures:
-            print(f"FAIL: {failure}")
-        return 1
-    print("all checks passed")
-    return 0
+    return checks.failures
 
 
 if __name__ == "__main__":

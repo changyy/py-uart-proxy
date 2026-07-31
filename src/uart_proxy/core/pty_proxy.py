@@ -15,8 +15,13 @@ attaches to a mirror as if it were the real device.
     ┌──────────────── PtyProxyGroup ────────────────┐
     │  RX bytes  ──broadcast──►  usbserial-110-0    │  e.g. an AI agent
     │                            usbserial-110-1    │  e.g. a human in screen
-    │  TX bytes  ◄──line-atomic merge──  (any mirror may write)
+    │  TX bytes  ◄──merged onto the wire──  (any mirror may write)
     └───────────────────────────────────────────────┘
+
+A mirror is **raw by default**, because that is what a serial port is and what
+every tool attached to one assumes: bytes cross the moment they are typed, so
+``^C`` interrupts now rather than eventually. ``--tx-merge line`` trades that
+away for whole-command atomicity between competing writers; see ``tx_merge``.
 
 This is an :class:`~uart_proxy.core.bus.EventBus` **sink**, parallel to the
 recorder and the socket proxy — it never opens the device itself. RX arrives as
@@ -46,6 +51,7 @@ import os
 import selectors
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
@@ -58,6 +64,7 @@ PTY_SUPPORTED = sys.platform != "win32" and hasattr(os, "openpty")
 
 if PTY_SUPPORTED:  # pragma: no cover - import guard, exercised on POSIX
     import pty
+    import termios
     import tty
 
 DEFAULT_PROXY_DIR = "/tmp/uart-proxy"
@@ -68,12 +75,40 @@ DEFAULT_PROXY_COUNT = 2
 #: pending bytes we drop (and count) instead of growing without bound.
 DEFAULT_QUEUE_MAX = 1 << 20  # 1 MiB
 
+#: How stale a mirror's backlog may get before it is thrown away.
+#:
+#: **A mirror is a live view.** History belongs to the recorder's log files and to
+#: `attach`, which can present it with its original timestamps; a raw byte pipe
+#: cannot. Without this bound, output that arrived while nobody was attached sits
+#: in the queue and is handed to whichever tool opens the mirror next — so a
+#: program reads minutes-old output and takes it for the current state, which is
+#: worse than missing it. (Most tools happen to flush on open: `screen` sets raw
+#: mode with ``TCSAFLUSH``, pyserial calls ``tcflush`` — but that is their
+#: accident, not our guarantee.)
+#:
+#: The window is generous on purpose: a reader that is genuinely attached and
+#: merely busy for a moment must not lose bytes, and this cannot tell "nobody is
+#: there" apart from "stuck for a while". Losing data from a live reader would be
+#: the worse failure of the two.
+DEFAULT_MAX_LAG = 5.0  # seconds
+
 #: In line-merge mode, flush a runaway line that never terminates at this size
 #: rather than buffering a client's binary upload forever.
 DEFAULT_LINE_MAX = 4096
 
 _LINE_TERMS = b"\n\r"  # either byte ends a line for merge purposes
-TX_MERGE_MODES = ("line", "raw")
+
+#: Bytes that are asynchronous **signals**, not content. They mean nothing as
+#: part of a line and are worse than useless if they arrive late — a ``^C`` that
+#: turns up whenever the sender next happens to press Enter interrupts the wrong
+#: thing. Line-merge therefore lets them overtake the buffer.
+SIGNAL_BYTES = bytes((0x03, 0x04, 0x1A, 0x1C))  # ^C INTR · ^D EOF · ^Z SUSP · ^\ QUIT
+
+#: Anything that ends the chunk currently being held in line-merge mode.
+_FLUSH_BYTES = _LINE_TERMS + SIGNAL_BYTES
+
+TX_MERGE_MODES = ("raw", "line")
+DEFAULT_TX_MERGE = "raw"
 
 _READ_CHUNK = 65536
 _SELECT_TIMEOUT = 0.5  # bounded so stop() is responsive even without a wakeup
@@ -115,7 +150,8 @@ class MirrorStats:
     slave: str
     rx_bytes: int = 0
     tx_bytes: int = 0
-    dropped: int = 0
+    dropped: int = 0    # discarded because a reader fell behind the size cap
+    stale: int = 0      # discarded because nobody drained it in time
     pending: int = 0
 
 
@@ -127,10 +163,12 @@ class PtyMirror:
     disconnects, and not reading it means we never steal bytes the client wrote.
     """
 
-    def __init__(self, name: str, link: str, *, queue_max: int = DEFAULT_QUEUE_MAX) -> None:
+    def __init__(self, name: str, link: str, *, queue_max: int = DEFAULT_QUEUE_MAX,
+                 max_lag: float = DEFAULT_MAX_LAG) -> None:
         self.name = name
         self.link = link
         self.queue_max = queue_max
+        self.max_lag = max_lag
 
         self.master, self.slave = pty.openpty()
         self.slave_name = os.ttyname(self.slave)
@@ -145,6 +183,10 @@ class PtyMirror:
         self.rx_bytes = 0
         self.tx_bytes = 0
         self.dropped = 0
+        self.stale = 0
+        self._progress_at = 0.0     # last time the client took bytes (or a
+                                    # backlog started); see drop_if_stale
+        self._warned_at = 0         # last `dropped` total we complained about
 
         _symlink_force(self.slave_name, self.link)
 
@@ -154,12 +196,55 @@ class PtyMirror:
         """Queue RX bytes for this client, dropping if it has fallen too far behind."""
         if len(self.out) + len(data) > self.queue_max:
             self.dropped += len(data)
-            logger.warning(
-                "%s: client not reading, dropped %d B total", self.name, self.dropped
-            )
+            # One line per 64 KiB, not per chunk: a client that stopped reading
+            # would otherwise fill the log faster than the device fills the queue.
+            if self.dropped - self._warned_at >= 64 * 1024:
+                self._warned_at = self.dropped
+                logger.warning("%s: reader is behind, dropped %d B so far",
+                               self.name, self.dropped)
             return
+        if not self.out:
+            self._progress_at = time.monotonic()  # a backlog starts forming now
         self.out += data
         self.rx_bytes += len(data)
+
+    def note_progress(self) -> None:
+        """Record that the client took some bytes.
+
+        The staleness rule is "no progress for a while", not "the oldest byte is
+        old": a reader that is merely slow but *is* draining must never have its
+        backlog thrown away, and only progress tells the two apart.
+        """
+        self._progress_at = time.monotonic()
+
+    def drop_if_stale(self) -> int:
+        """Throw away a backlog nobody is draining, and say how much.
+
+        This is what keeps a mirror a *live* view (see :data:`DEFAULT_MAX_LAG`).
+        The kernel's own pty buffer is flushed too, otherwise the couple of KiB it
+        absorbed before it filled would still be waiting for the next tool to
+        open the mirror.
+        """
+        if not self.out or self.max_lag <= 0:
+            return 0
+        if time.monotonic() - self._progress_at < self.max_lag:
+            return 0
+        discarded = len(self.out)
+        self.out.clear()
+        self.stale += discarded
+        # Also clear what the kernel already absorbed, or the couple of KiB it
+        # took before its buffer filled would still greet the next tool to open
+        # the mirror. It has to be the *slave's input* queue: that is where bytes
+        # written to the master wait. TCOFLUSH on the master does nothing here
+        # (measured), and TCIOFLUSH would also throw away the TX a client has
+        # just written, which is not ours to drop.
+        try:
+            termios.tcflush(self.slave, termios.TCIFLUSH)
+        except (OSError, termios.error):
+            pass
+        logger.debug("%s: discarded %d B nobody read within %.1fs",
+                     self.name, discarded, self.max_lag)
+        return discarded
 
     # ── teardown ───────────────────────────────────────────────────────────
 
@@ -185,6 +270,7 @@ class PtyMirror:
             rx_bytes=self.rx_bytes,
             tx_bytes=self.tx_bytes,
             dropped=self.dropped,
+            stale=self.stale,
             pending=len(self.out),
         )
 
@@ -201,11 +287,18 @@ class PtyProxyGroup:
         ``session.write``. Raising is fine and non-fatal (a disconnected session
         raises ``RuntimeError``) — the bytes are dropped and reported.
     tx_merge:
-        ``"line"`` (default) buffers each client's bytes until a line terminator
-        and forwards the whole line in one ``on_tx`` call, so two people typing
-        at once can never splice one command into the middle of another.
-        ``"raw"`` forwards bytes the moment they arrive — lower latency, but
-        interleaving is then the caller's problem.
+        ``"raw"`` (default) forwards every byte the instant it arrives — what a
+        serial port *is*, and what every attached tool assumes: ``^C`` interrupts
+        now, tab completion completes, arrow keys reach the shell's history, a
+        single-key ``y/n`` prompt works, escape sequences stay intact.
+
+        ``"line"`` instead holds each client's bytes until a line terminator and
+        forwards the whole line in one ``on_tx`` call, so two writers typing at
+        once cannot splice one command into the middle of another. That costs
+        every interactive behaviour listed above, so it is opt-in: take it when
+        several *unattended* writers share the wire and a mangled command would
+        be worse than a laggy one. :data:`SIGNAL_BYTES` still overtake the buffer
+        even here, because a delayed ``^C`` is not a slow ``^C``, it is a wrong one.
     on_notice:
         Optional sink for human-readable operational messages (dropped TX,
         overrun clients). Normally ``session.publish_notice``.
@@ -216,9 +309,10 @@ class PtyProxyGroup:
         links: Sequence[str],
         on_tx: Callable[[bytes], int],
         *,
-        tx_merge: str = "line",
+        tx_merge: str = DEFAULT_TX_MERGE,
         on_notice: Optional[Callable[[str], None]] = None,
         queue_max: int = DEFAULT_QUEUE_MAX,
+        max_lag: float = DEFAULT_MAX_LAG,
         line_max: int = DEFAULT_LINE_MAX,
     ) -> None:
         if tx_merge not in TX_MERGE_MODES:
@@ -231,6 +325,7 @@ class PtyProxyGroup:
         self.tx_merge = tx_merge
         self._on_notice = on_notice
         self._queue_max = queue_max
+        self._max_lag = max_lag
         self._line_max = line_max
 
         self.mirrors: list[PtyMirror] = []
@@ -260,7 +355,8 @@ class PtyProxyGroup:
         try:
             for link in self._links:
                 mirror = PtyMirror(
-                    name=os.path.basename(link), link=link, queue_max=self._queue_max
+                    name=os.path.basename(link), link=link,
+                    queue_max=self._queue_max, max_lag=self._max_lag
                 )
                 self.mirrors.append(mirror)
             self._wake_r, self._wake_w = os.pipe()
@@ -347,9 +443,13 @@ class PtyProxyGroup:
 
             while not self._stop.is_set():
                 # Ask for writability only where something is actually pending,
-                # so an idle mirror doesn't spin the loop.
+                # so an idle mirror doesn't spin the loop. Anything nobody has
+                # taken by now is thrown out first: a mirror is a live view, and
+                # handing stale output to the next tool that opens it would make
+                # a program read the past as the present.
                 with self._lock:
                     for mirror in self.mirrors:
+                        mirror.drop_if_stale()
                         mask = selectors.EVENT_READ
                         if mirror.out:
                             mask |= selectors.EVENT_WRITE
@@ -386,6 +486,8 @@ class PtyProxyGroup:
             return
         with self._lock:
             del mirror.out[:written]
+            if written:
+                mirror.note_progress()  # it is reading, so it is not stale
 
     def _pump_tx(self, mirror: PtyMirror) -> None:
         """Read what the client typed and merge it onto the wire."""
@@ -406,7 +508,7 @@ class PtyProxyGroup:
             mirror.txline += data
             ready: list[bytes] = []
             while True:
-                cut = _first_line_end(mirror.txline)
+                cut = _first_flush_point(mirror.txline)
                 if cut is None:
                     break
                 ready.append(bytes(mirror.txline[: cut + 1]))
@@ -437,9 +539,17 @@ class PtyProxyGroup:
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
-def _first_line_end(buf: bytearray) -> Optional[int]:
-    """Index of the earliest ``\\n`` or ``\\r`` in ``buf``, or None."""
-    found = [i for i in (buf.find(b"\n"), buf.find(b"\r")) if i >= 0]
+def _first_flush_point(buf: bytearray) -> Optional[int]:
+    """Index of the earliest byte in ``buf`` that ends the held chunk, or None.
+
+    That is a line terminator — the point of line-merge — **or** one of
+    :data:`SIGNAL_BYTES`. Both cases emit ``buf[: i + 1]``, so a ``^C`` typed
+    after a half-finished command sends that partial text *and* the ``^C``
+    together, in one write: the signal is never delayed, and bytes the client
+    already handed us are never silently discarded (the device's own line
+    discipline is what cancels the abandoned line).
+    """
+    found = [i for i in (buf.find(bytes([b])) for b in _FLUSH_BYTES) if i >= 0]
     return min(found) if found else None
 
 

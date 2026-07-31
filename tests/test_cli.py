@@ -12,6 +12,7 @@ from uart_proxy.cli import _maybe_build_pty_proxy, _resolve_output_dir, build_pa
 from uart_proxy.core.pty_proxy import (
     DEFAULT_PROXY_COUNT,
     DEFAULT_PROXY_DIR,
+    DEFAULT_TX_MERGE,
     PTY_SUPPORTED,
 )
 
@@ -77,13 +78,15 @@ def test_parser_proxy_flags():
     assert args.no_exclusive is True
 
 
-def test_proxy_defaults_are_two_mirrors_line_merged():
+def test_proxy_defaults_are_two_raw_mirrors():
+    """Raw is the default: a mirror behaves like the serial port it stands in
+    for. Holding bytes to keep commands atomic is the opt-in."""
     args = build_parser().parse_args(
         ["connect", "--port", "/dev/cu.usbserial-110", "--proxy-dir"]
     )
     assert args.proxy_dir == DEFAULT_PROXY_DIR
     assert args.proxy_count == DEFAULT_PROXY_COUNT == 2
-    assert args.tx_merge == "line"
+    assert args.tx_merge == DEFAULT_TX_MERGE == "raw"
 
 
 def test_mirrors_are_off_unless_asked_for():

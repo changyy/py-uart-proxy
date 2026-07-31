@@ -26,16 +26,52 @@ Client's first line MUST be an auth request:
 
 ```json
 {"type": "auth", "code": "123456"}
+{"type": "auth", "code": "123456", "replay": 2000}
 ```
 
 Server replies with exactly one of:
 
 ```json
-{"type": "auth_ok", "role": "full", "source": "/dev/tty.usbserial @ 115200"}
+{"type": "auth_ok", "role": "full", "source": "/dev/tty.usbserial @ 115200", "replay_available": 1832, "elapsed": 9482.11}
 {"type": "auth_fail", "reason": "invalid code"}
 ```
 
 On `auth_fail` the server closes the connection.
+
+- `replay` (optional, client) — ask for up to N lines of recent history before the
+  live stream starts. Omit it, or send `0`, for live only.
+- `replay_available` (optional, server) — how many lines the server *could* have
+  offered. Informational.
+- `elapsed` (optional, server) — where the server's session is on its own clock,
+  in seconds. A client should **adopt this as its own origin** so that replayed
+  and live output share one elapsed axis, and so a line's elapsed value means the
+  same thing as in the server's log files. A client that ignores it measures from
+  its own connect instead, and its elapsed column will jump backwards where the
+  replay block ends.
+
+All three fields are additive: a client or server that doesn't know them behaves
+exactly as before.
+
+## Replay (optional, immediately after `auth_ok`)
+
+If the client asked for `replay` and the server has history, the server sends it
+**before adding the client to the live fan-out** — so everything after the block
+is guaranteed to be the present:
+
+```json
+{"type": "replay", "seq": 812, "wall": "2026-07-31 19:09:52", "elapsed": 9470.52, "text": "login:"}
+{"type": "replay", "seq": 813, "wall": "2026-07-31 19:09:53", "elapsed": 9471.88, "text": "root@target:~#"}
+{"type": "replay_end", "count": 2, "from": "2026-07-31 19:09:52", "to": "2026-07-31 19:09:53"}
+```
+
+- Replayed lines are their **own message type**, never `rx`: they are the past
+  and must not be mistaken for what is happening now. `wall` and `elapsed` are
+  the server's, from when the line actually arrived.
+- `replay_end` always follows, even with `count: 0` — a client waiting for it must
+  not hang against a server that has no history.
+- A client should display these distinctly (uart-proxy dims them between
+  `── replayed … ──` and `── live ──` dividers). They must **not** be fed back
+  through a recorder or a plugin pipeline: the server already did that.
 
 ### Roles
 
@@ -56,9 +92,10 @@ mode (e.g. a mobile viewer).
 {"type": "pong"}
 ```
 
-- `rx` — device output. `hex` is authoritative (raw bytes); `text` is a UTF-8
-  best-effort decode for display. `wall` is the server's local time
+- `rx` — device output, **live only**. `hex` is authoritative (raw bytes); `text`
+  is a UTF-8 best-effort decode for display. `wall` is the server's local time
   (`%Y-%m-%d %H:%M:%S`); `elapsed` is seconds since the server session started.
+  History is never sent as `rx` — see Replay above.
 - `seq` is a monotonically increasing counter.
 
 ## Client → server (after auth)

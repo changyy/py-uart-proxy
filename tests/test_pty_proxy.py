@@ -190,6 +190,59 @@ def test_only_device_rx_is_mirrored(tmp_path):
             assert read_bytes(fd, 4) == b"real"
 
 
+def _read_without_flushing(link: str, timeout: float = 0.8) -> bytes:
+    """Attach the way `cat` would — no termios call, so nothing is flushed.
+
+    `screen` sets raw mode with TCSAFLUSH and pyserial calls tcflush on open, so
+    both would hide a stale backlog by accident. This is the reader that doesn't.
+    """
+    fd = os.open(link, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        return read_bytes(fd, 1 << 20, timeout=timeout)
+    finally:
+        os.close(fd)
+
+
+def test_a_mirror_is_a_live_view_not_a_backlog(tmp_path):
+    """Output that arrived while nobody was attached must not be handed to the
+    next tool that opens the mirror: a program would read the past as the
+    present, which is worse than not seeing it. History is the log's job."""
+    with group(tmp_path, count=1, max_lag=0.3) as (grp, _):
+        for _ in range(200):
+            grp.handle(_rx(b"x" * 200 + b"\r\n"))
+        assert wait_for(lambda: grp.stats()[0].stale > 0, timeout=3.0), \
+            "a backlog nobody drained should have been discarded"
+        assert grp.stats()[0].pending == 0
+        assert _read_without_flushing(grp.links[0]) == b"", \
+            "the kernel's own pty buffer must be cleared too"
+
+        # Still a working mirror: what arrives from now on gets through.
+        grp.handle(_rx(b"live now\r\n"))
+        assert b"live now" in _read_without_flushing(grp.links[0])
+
+
+def test_a_slow_but_real_reader_never_loses_data(tmp_path):
+    """The rule is "no progress for a while", not "the oldest byte is old" — a
+    reader that is merely slow is still a reader."""
+    with group(tmp_path, count=1, max_lag=0.3) as (grp, _):
+        with client(grp.links[0]) as fd:
+            received = 0
+            for i in range(6):  # 1.8s total, six times the lag window
+                grp.handle(_rx(f"chunk {i}\r\n".encode()))
+                time.sleep(0.3)
+                received += len(read_bytes(fd, 1 << 20, timeout=0.05))
+            assert grp.stats()[0].stale == 0, "punished a client that was reading"
+            assert received > 0
+
+
+def test_staleness_can_be_switched_off(tmp_path):
+    with group(tmp_path, count=1, max_lag=0) as (grp, _):
+        grp.handle(_rx(b"kept\r\n"))
+        time.sleep(0.4)
+        assert grp.stats()[0].stale == 0
+        assert b"kept" in _read_without_flushing(grp.links[0])
+
+
 def test_a_client_that_stops_reading_drops_instead_of_growing(tmp_path):
     """A stalled reader must not be able to consume memory without bound, nor
     stall the other mirrors."""
@@ -244,6 +297,61 @@ def test_raw_merge_forwards_without_waiting_for_a_line(tmp_path):
             os.write(fd, b"no newline here")
             assert wait_for(lambda: writes)
             assert b"".join(writes) == b"no newline here"
+
+
+def test_raw_is_the_default(tmp_path):
+    """A mirror is a serial port; a serial port passes bytes through. Holding
+    them is the special case you opt into, not the other way round."""
+    with group(tmp_path, count=1) as (grp, writes):
+        assert grp.tx_merge == "raw"
+        with client(grp.links[0]) as fd:
+            os.write(fd, b"a")
+            assert wait_for(lambda: writes)
+            assert b"".join(writes) == b"a"
+
+
+# ── signals must not be held, even in line-merge mode ───────────────────────
+
+
+@pytest.mark.parametrize(
+    "byte, name",
+    [(b"\x03", "^C INTR"), (b"\x04", "^D EOF"),
+     (b"\x1a", "^Z SUSP"), (b"\x1c", "^\\ QUIT")],
+)
+def test_a_signal_is_never_held_waiting_for_a_line(tmp_path, byte, name):
+    """A ^C that arrives whenever the sender next presses Enter interrupts the
+    wrong thing — it isn't a slow ^C, it's a wrong one."""
+    with group(tmp_path, count=1, tx_merge="line") as (grp, writes):
+        with client(grp.links[0]) as fd:
+            os.write(fd, byte)
+            assert wait_for(lambda: writes), f"{name} was swallowed by line-merge"
+            assert b"".join(writes) == byte
+
+
+def test_a_signal_takes_the_half_typed_line_with_it(tmp_path):
+    """Order is preserved and nothing the client gave us is dropped: the device's
+    own line discipline is what discards the abandoned command."""
+    with group(tmp_path, count=1, tx_merge="line") as (grp, writes):
+        with client(grp.links[0]) as fd:
+            os.write(fd, b"reboo")
+            time.sleep(0.05)
+            assert not writes, "a partial line alone must still be held"
+            os.write(fd, b"\x03")
+            assert wait_for(lambda: writes)
+            assert b"".join(writes) == b"reboo\x03"
+
+
+def test_text_control_bytes_are_still_part_of_the_line(tmp_path):
+    """Tab and ESC are content, not signals — ESC especially, since flushing it
+    alone would split the escape sequence its following bytes belong to."""
+    with group(tmp_path, count=1, tx_merge="line") as (grp, writes):
+        with client(grp.links[0]) as fd:
+            os.write(fd, b"ls\t\x1b[A")
+            time.sleep(0.15)
+            assert not writes, "line-merge should still be holding this"
+            os.write(fd, b"\r")
+            assert wait_for(lambda: writes)
+            assert b"".join(writes) == b"ls\t\x1b[A\r"
 
 
 def test_tx_to_a_disconnected_device_is_reported_and_survives(tmp_path):

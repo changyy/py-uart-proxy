@@ -59,6 +59,24 @@ class TimestampTracker:
     def start_wall(self) -> datetime:
         return self._start_wall
 
+    def rebase(self, elapsed_now: float) -> None:
+        """Move the origin so that *now* reads as ``elapsed_now`` seconds in.
+
+        Used when attaching to a session already running elsewhere: the client
+        adopts the **server's** timeline, so replayed history and live output
+        share one elapsed axis and a line's elapsed means the same thing here as
+        in the server's own log files. Without it the two are measured from
+        different origins and the column appears to jump backwards exactly where
+        replay ends.
+
+        Only the origin moves — the monotonic source is untouched, so stamps
+        still never go backwards if the system clock is adjusted.
+        """
+        if elapsed_now < 0:
+            return
+        self._start_mono = time.monotonic() - elapsed_now
+        self._start_wall = datetime.now() - timedelta(seconds=elapsed_now)
+
     def stamp(self) -> Stamp:
         """Capture the current instant in both axes."""
         elapsed = time.monotonic() - self._start_mono

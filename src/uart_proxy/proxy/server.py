@@ -25,6 +25,7 @@ import threading
 from typing import TYPE_CHECKING, Optional
 
 from ..core.events import Direction, Event, EventKind
+from ..core.replay import ReplayBuffer
 from .protocol import EOL_MAP, Role, decode_message, encode_message
 
 if TYPE_CHECKING:  # avoid a circular import; only needed for type hints
@@ -108,11 +109,14 @@ class ProxyServer:
         *,
         host: str = "0.0.0.0",
         port: int = 9600,
+        replay: Optional[ReplayBuffer] = None,
     ) -> None:
         self.session = session
         self.auth = auth
         self.host = host
         self.port = port
+        # Optional history, so an attaching client can be shown what it missed.
+        self.replay = replay
 
         self._srv: Optional[socket.socket] = None
         self._accept_thread: Optional[threading.Thread] = None
@@ -218,10 +222,50 @@ class ProxyServer:
                     "type": "auth_ok",
                     "role": role.value,
                     "source": self.session.source.description(),
+                    "replay_available": len(self.replay) if self.replay else 0,
+                    # Where this session is on its own clock, so a client can
+                    # adopt our timeline instead of starting a second one.
+                    "elapsed": round(self.session.tracker.stamp().elapsed, 4),
                 },
             )
+            self._send_replay(client, msg.get("replay"))
             return True
         return False  # disconnected before sending auth
+
+    def _send_replay(self, client: _Client, requested) -> None:
+        """Send the history this client asked for, before any live traffic.
+
+        Sent *before* the client is added to the fan-out set, so replayed lines
+        can never be interleaved with live ones — the client can rely on
+        everything after ``replay_end`` being the present.
+
+        Replayed lines go out as their own ``replay`` message type rather than as
+        ``rx``: they carry the server's original stamps and must not be mistaken
+        for what is happening now. A client that asks for no replay, or an older
+        one that does not know the field, gets nothing and behaves exactly as
+        before.
+        """
+        if requested is None:
+            return
+        try:
+            limit = int(requested)
+        except (TypeError, ValueError):
+            return
+        if limit <= 0:
+            return
+        # Answer even with nothing to send. A client that asked is waiting for
+        # `replay_end`; making it wait out its timeout instead (that path exists
+        # only to cope with *older* servers) would put seconds of dead air into
+        # every attach to a session started with --replay-lines 0.
+        entries = self.replay.snapshot(limit) if self.replay is not None else []
+        for entry in entries:
+            self._send_now(client, entry.to_message())
+        self._send_now(client, {
+            "type": "replay_end",
+            "count": len(entries),
+            "from": entries[0].wall if entries else None,
+            "to": entries[-1].wall if entries else None,
+        })
 
     # ── client → server ──────────────────────────────────────────────────────
 

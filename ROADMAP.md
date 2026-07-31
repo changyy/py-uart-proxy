@@ -42,10 +42,36 @@ The seven original requirements, implemented end to end.
 - ✅ **Local PTY mirrors** (SPEC S14): `connect --proxy-dir DIR [--proxy-count N]`
   exposes N full-duplex PTYs (default 2 = 2 readers *and* 2 writers), symlinked
   into `DIR`, so `screen` / `minicom` / pyserial / an agent can share the one
-  port while uart-proxy keeps it. RX broadcast, TX line-atomic merged
-  (`--tx-merge raw` to pass bytes straight through). POSIX only.
+  port while uart-proxy keeps it. RX broadcast; TX **raw by default** so `^C`,
+  tab completion and arrow keys behave, with `--tx-merge line` as the opt-in that
+  keeps concurrent commands atomic instead. POSIX only.
   - 💡 Extend it to `remote` too (mirror a *remote* stream locally) — the sink is
     already source-agnostic; only the `remote` subparser lacks the flags.
+- ✅ **Background sessions** (SPEC S17): `start` detaches (double fork + setsid),
+  `status` lists what's running with time-since-last-output, `stop` shuts down in
+  order. One `0600` JSON state file per session under `~/.uart-proxy/daemons/` is
+  the whole registry; `UART_PROXY_HOME` relocates it. A daemon always serves the
+  proxy on loopback with a generated auth code.
+- ✅ **`attach` + replay** (SPEC S18): `uart-proxy attach [name]` joins a running
+  background session and shows the recent history first, with the stamps from
+  when each line actually arrived, then the live tail. History is a bounded ring
+  of *events* (`ReplayBuffer`) — bytes would lose the timestamps, which is most of
+  the value. Protocol additions are all optional fields (`auth.replay`,
+  `auth_ok.replay_available`, `auth_ok.elapsed`, `replay` / `replay_end`), so
+  older clients are unaffected. `remote --replay-lines N` works the same way.
+  - This settled the open question below: a client now **adopts the server's**
+    elapsed origin, because with replay, re-stamping locally makes the elapsed
+    column jump backwards where the history ends.
+- ✅ **Character input + the `Ctrl-]` command prefix** (SPEC S19): `--input char`
+  or `<prefix> c` sends every keystroke as typed, so `^C`, `^D`, Tab completion
+  and arrow-key history finally reach the device (none of them did before —
+  `Ctrl+C` was Textual's quit and `Ctrl+D` was eaten by the input widget).
+  `Ctrl+]` is telnet's escape, chosen for the same reason `screen`'s `Ctrl-A` and
+  tmux's `Ctrl-B` are wrong here — both are readline keys a serial console needs.
+  `<prefix> d` detaches, `q` quits, `<prefix> <prefix>` sends the literal byte,
+  `--prefix` reconfigures. Verified by spike that Textual delivers `ctrl+c` to
+  `on_key` and that the app survives it; character mode also stands the app's own
+  priority bindings down (`check_action`) so `Ctrl+W` reaches the shell.
   - 💡 Surface mirror count / dropped bytes in the TUI status bar.
 - ⬜ **Port-busy hint**: when opening a port fails because another process holds
   it (UART is exclusive-open — and now doubly so, since we claim it ourselves),

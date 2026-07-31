@@ -41,6 +41,10 @@ Beyond the original seven:
 - **Local PTY mirrors** — deliberately share the one port with `screen`,
   `minicom`, pyserial or an AI agent: `--proxy-dir DIR --proxy-count 2` gives 2
   full-duplex mirrors (POSIX).
+- **Background sessions** — `start` / `status` / `stop`: keep the port, the
+  recording and the proxy alive after the terminal closes (POSIX).
+- **`attach` with replay** — rejoin a background session and see what happened
+  while nobody was watching, with the timestamps it really happened at.
 
 ---
 
@@ -101,10 +105,47 @@ In the TUI:
 | `Ctrl+Y` | toggle hex view |
 | `Ctrl+K` | clear the log **and** reset the `Ctrl+W` copy range |
 | `Ctrl+Q` | quit |
+| `Ctrl+]` | **command prefix** — see below (`Ctrl+] ?` lists the commands) |
 
 The status bar shows the connection state (`● live` / `○ waiting`), the port and
 baud (e.g. `… @ 115200 8N1`), the elapsed clock, byte counts, and whether the
 view is following the tail (`follow` / `paused ▲`).
+
+#### Character mode, and the `Ctrl+]` prefix
+
+Line mode is comfortable for typing commands, but it cannot express anything a
+shell needs *right now*: `^C` to interrupt a runaway command, `^D` for EOF, Tab
+to complete, ↑ for history. **Character mode** sends every keystroke as you press
+it, which is what a serial terminal normally does:
+
+```
+Ctrl+] c        switch character ⇄ line mode
+uart-proxy connect --port … --input char     # or start in it
+```
+
+In character mode almost every key belongs to the device — including `Ctrl+C`,
+which no longer quits — so exactly **one** key is reserved as a command prefix:
+
+| Keys | Effect |
+|------|--------|
+| `Ctrl+] ?` | list the commands |
+| `Ctrl+] d` | **detach** — leave a background session running (see §7) |
+| `Ctrl+] q` | quit |
+| `Ctrl+] c` | switch character ⇄ line mode |
+| `Ctrl+] t` `y` `k` `w` `e` | timestamps · hex · clear · copy · select mode |
+| `Ctrl+] Ctrl+]` | send a literal `Ctrl+]` to the device |
+
+**Why `Ctrl+]`?** It is telnet's escape, picked there for this exact problem. The
+obvious alternatives are worse for a serial console, because what's usually on the
+far end is a shell: `screen`'s `Ctrl+A` is readline's line-start and tmux's
+`Ctrl+B` is back-one-character, so both get hit by accident all day. `Ctrl+]`
+means nothing to readline, and nothing to flow control either (unlike `Ctrl+Q`,
+which is XON). Change it with `--prefix ctrl+a` if you disagree — and since
+`<prefix> <prefix>` always sends the literal byte, the choice is never a dead end.
+
+The familiar `Ctrl+T` / `Ctrl+Y` / `Ctrl+K` / `Ctrl+W` / `Ctrl+E` still work
+directly **in line mode**, where they can't conflict with anything. In character
+mode they stand down so the device gets them, and stay reachable via the prefix.
 
 #### Copying log text
 
@@ -352,16 +393,28 @@ python -c "import serial; s=serial.Serial('/tmp/uart-proxy/usbserial-110-0')"
 ```
 
 - **Everyone sees everything the device says** — RX is broadcast to every mirror.
-- **Anyone may type.** Concurrent writers are merged **line-atomically** by
-  default: your bytes are held until you finish the line, then the whole line
-  goes out in one write, so two people typing at once can never turn `reboot` +
-  `whoami` into `rebwhooot`. Use `--tx-merge raw` for byte-for-byte passthrough
-  if latency matters more than that.
+- **Anyone may type, and every byte crosses immediately** (`--tx-merge raw`, the
+  default). A mirror behaves like the port it stands in for: `^C` interrupts the
+  running command *now*, tab completion completes, arrow keys reach the shell's
+  history, a single-key `y/n` prompt answers.
+- **`--tx-merge line`** is the opt-in alternative: your bytes are held until you
+  finish the line, then the whole line goes out in one write, so two writers can
+  never turn `reboot` + `whoami` into `rebwhooot`. That costs every interactive
+  behaviour above, so reach for it when several *unattended* writers share the
+  wire and a mangled command would be worse than a laggy one. `^C` `^D` `^Z` `^\`
+  are still sent immediately even here — a signal delivered late isn't slow, it
+  interrupts the wrong thing.
 - A mirror shows **device output only**, not what another mirror typed. Real
   consoles echo, so you still see the other person's command come back — and
   staying transparent is what lets an unmodified `screen` work.
+- **A mirror shows you the present, not a backlog.** Output that arrived while
+  nobody was attached is discarded after `--proxy-max-lag` seconds (default 5),
+  so the tool you attach next sees what the device says *from now on*. This
+  matters most for programs: reading minutes-old output as the current state is
+  worse than not seeing it at all. The full record is in the log files.
 - A client that stops reading gets its backlog dropped (past 1 MiB) rather than
-  stalling everyone else.
+  stalling everyone else. A client that is merely *slow* loses nothing — the rule
+  is "no progress", not "old bytes".
 - Symlinks are cleaned up on exit, including `SIGTERM`; a stale one from a
   `kill -9` is replaced on the next start.
 
@@ -374,13 +427,19 @@ demonstration of what sharing actually looks like:
 
 ```console
 $ python examples/check_pty_mirrors.py
+============ --tx-merge raw ============
   ✓ 2 mirrors announced and symlinked
   ✓ device RX is broadcast to every mirror
   ✓ a mirror's TX reaches the device
-  ✓ a partial line is held back
-  ✓ both commands arrive intact (line-atomic merge)
+  ✓ a single byte crosses without waiting for Enter
+  ✓ ^C reaches the device immediately
   ✓ the device's reply is visible to both mirrors
   ✓ SIGTERM removes the symlinks
+============ --tx-merge line ===========
+  ✓ a partial line is held back
+  ✓ both commands arrive intact (line-atomic merge)
+  ✓ ^C is not held by line-merge
+  …
 ```
 
 > **What this can't do.** A UART is one unframed byte stream, so nothing at this
@@ -390,7 +449,96 @@ $ python examples/check_pty_mirrors.py
 >
 > POSIX only — Windows has no `pty`. Use `--serve` there.
 
-### 7. Plugins (pattern watching)
+### 7. Run it in the background (`start` / `status` / `stop`)
+
+A serial session is long-lived — you want it to survive closing the terminal, and
+to be able to walk away and come back:
+
+```bash
+uart-proxy start --port /dev/cu.usbserial-110 --name router \
+    --proxy-dir /tmp/uart-proxy
+```
+```
+Started 'router' — /dev/cu.usbserial-110 @ 115200
+  proxy    127.0.0.1:9600 (auth in ~/.uart-proxy/daemons/router.json)
+  logs     ~/.uart-proxy/sessions/20260731-095337
+  mirrors  /tmp/uart-proxy
+  stop it  uart-proxy stop router
+```
+
+It keeps the port, keeps recording and keeps serving with nobody watching.
+
+```bash
+uart-proxy status              # what's running, and how long since it last heard anything
+uart-proxy stop router         # ordered shutdown (--all, --force)
+```
+```
+NAME                 PID      UP   QUIET  PORT
+router             68510      2h      3s  /dev/cu.usbserial-110 @ 115200
+```
+
+`QUIET` is time since the last recorded byte — usually the thing you actually want
+to know about a session you left running.
+
+While it runs you can reach it two ways, and both work at the same time:
+
+```bash
+uart-proxy remote --host 127.0.0.1 --auth "$(python3 -c \
+  'import json;print(json.load(open("'"$HOME"'/.uart-proxy/daemons/router.json"))["auth"])')"
+screen /tmp/uart-proxy/router-1        # or just attach to a mirror
+```
+
+- A daemon **always serves the proxy** — one you can't reach is useless — bound to
+  `127.0.0.1` unless `--listen` says otherwise, with a generated auth code in its
+  `0600` state file.
+- `--name` names the **session and its mirrors** (`router-0`, `router-1`), so one
+  word is the handle for the whole thing. Without it, both default to the device
+  stem.
+- `connect` is unchanged: foreground, single process, no daemon. Detaching is
+  explicit, because a leftover daemon holding the port (it claims it exclusively —
+  see above) is a confusing thing to inflict on the simple case.
+- `start` **fails if the daemon fails** — it waits for the child to report that
+  it's serving. An *absent device* isn't a failure, though: waiting for it to be
+  plugged in is normal.
+- `kill -9` on a daemon leaves its state file and mirror symlinks behind; the next
+  `status`, `stop` or `start` clears them.
+
+#### Attaching back to it
+
+```bash
+uart-proxy attach            # the only running session
+uart-proxy attach router     # by name
+```
+
+You get **what you missed first**, dimmed, with the timestamps from when it
+actually happened — then the live tail:
+
+```
+── replayed 4 lines · 2026-07-31 19:09:52 → 2026-07-31 19:09:53 (1.1s) ──
+[2026-07-31 19:09:52 | 00:00:01.5229] [boot 0] initialising subsystem 0
+[2026-07-31 19:09:53 | 00:00:02.5873] [boot 3] initialising subsystem 3
+── live ──
+[2026-07-31 19:09:55 | 00:00:04.9557] [live] this arrived AFTER attaching
+```
+
+- Host, port and auth code come from the session's state file — nothing to type.
+- The elapsed column is the **daemon's** clock, for replayed and live lines alike,
+  so it matches the daemon's own log files instead of restarting at zero when you
+  attach.
+- `--replay-lines N` sets how much history (default 2000, `0` for live only).
+- Several clients may attach at once, each with its own view; the daemon keeps
+  the port either way.
+- Replay is display-only — the daemon already recorded those lines and already
+  ran your `--grep` rules on them, so an attaching client doesn't do it again.
+- `uart-proxy remote --replay-lines N` gets the same thing from a *remote*
+  server.
+
+> **Leaving** an attached client (`Ctrl+Q`, or just closing the terminal) leaves
+> the daemon running — that is the useful half of detach. A proper
+> `<prefix> d` keystroke arrives with the `Ctrl-]` command prefix; see
+> [ROADMAP.md](./ROADMAP.md).
+
+### 8. Plugins (pattern watching)
 
 Quick grep:
 
@@ -429,7 +577,8 @@ py-uart-proxy/
   ROADMAP.md           ← action items / status
   src/uart_proxy/
     core/    timestamp · events · bus · line_assembler · recorder · session
-             retention · pty_proxy (local PTY mirrors)
+             retention · pty_proxy (local PTY mirrors) · daemon (background
+             sessions: state files, detach, liveness) · replay (history for attach)
     io/      source (ABC) · uart_source · socket_source
     proxy/   protocol (JSON-lines + auth/roles) · server
     plugins/ base · manager · builtin/grep

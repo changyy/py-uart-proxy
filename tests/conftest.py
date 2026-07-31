@@ -34,10 +34,15 @@ class FakeSource(DataSource):
         self.opened = False
         self.closed = False
         self._drop = threading.Event()  # set -> next read() raises (device drop)
+        # Signals feed() -> read(). A Condition rather than an Event because an
+        # Event has a lost-wakeup window: data fed between wait() returning and
+        # clear() would be missed until the next poll.
+        self._arrived = threading.Condition(self._lock)
 
     def feed(self, data: bytes) -> None:
-        with self._lock:
+        with self._arrived:
             self._buf.extend(data)
+            self._arrived.notify_all()
 
     def drop(self) -> None:
         """Simulate the device going away on the next read()."""
@@ -58,7 +63,12 @@ class FakeSource(DataSource):
         if self._drop.is_set():
             self._drop.clear()
             raise IOError("device disconnected")
-        with self._lock:
+        # Wait out the timeout like a real source would if there's nothing yet.
+        # Returning b"" immediately turns the session's read loop into a busy
+        # spin, which starves the asyncio loop the TUI tests run on.
+        with self._arrived:
+            if not self._buf:
+                self._arrived.wait(timeout)
             if not self._buf:
                 return b""
             out = bytes(self._buf[:max_bytes])
