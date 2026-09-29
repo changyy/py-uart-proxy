@@ -529,6 +529,12 @@ and `Ctrl+D` was eaten by the input widget's emacs keys.
   - The app's own `priority=True` bindings must **stand down** (`check_action`),
     or `Ctrl+W` would still be "copy log" instead of the shell's kill-word —
     stealing keys from the device is the very thing this fixes.
+  - **The footer must stand down with them.** `Ctrl+Q` is XON and `End` is an
+    escape sequence, so both belong to the device here; a footer still offering
+    "Quit" is worse than useless, because pressing it does nothing visible and
+    leaves you believing you quit while the session runs on **holding the port
+    exclusively**. In character mode the quit key is `<prefix> q`, and the status
+    bar says so — it is then the only thing on screen that does.
 - **One key is reserved**, the command prefix, `Ctrl+]` by default. Not `screen`'s
   `Ctrl+A` or tmux's `Ctrl+B`: on a serial console the far end is usually a shell,
   where those are line-start and back-one-character. `Ctrl+]` is telnet's escape,
@@ -566,5 +572,101 @@ and `Ctrl+D` was eaten by the input widget's emacs keys.
 - In character mode `Ctrl+W/T/Y/K/E` arrive at the device as
   `\x17\x14\x19\x0b\x05`; in line mode `Ctrl+T` still cycles timestamps and
   sends nothing.
+- `Ctrl+Q` reaches the device as `\x11` in character mode without quitting, and
+  `End` as `\x1b[F`; the footer offers neither there, and offers `Ctrl+Q` in
+  line mode.
 - `<prefix> d` sets the detached state when detachable, and when not, leaves the
   app running and says there is nothing to detach from.
+
+## S20. The terminal view (character mode's other half)
+
+S19 fixed *input*: every keystroke reaches the device. It left *output* as it
+was — a log of finished lines — and that turned out to be only half a terminal.
+
+The two models are incompatible by construction. A log appends: a row, once
+written, is final. A shell talks to a **screen**: it echoes a character where the
+cursor is, takes it back with `BS`, repaints the row from column 0 with `CR`,
+addresses a region with an ANSI sequence. None of that can be expressed by
+appending a row.
+
+The symptom was concrete and made the feature look broken. The session
+force-flushes a partial RX line after `_IDLE_FLUSH` (0.2 s) so a prompt without a
+newline (`login: `) appears at all. At human typing speed *every echoed keystroke*
+cleared that timer on its own, so each character was flushed as its own "line":
+typing `ls` produced two rows. Switching to character mode made the device
+reachable and the output unreadable.
+
+So character mode renders through a real terminal emulator (`pyte`), and the
+view switches with the mode:
+
+```
+RX bytes ─┬─> LineAssembler ──> LINE events ──> log view, recorder,
+          │                                     plugins, proxy clients
+          └─> pyte.Screen ────────────────────> terminal view
+```
+
+- **The terminal view is the device's screen now** — colour, cursor, in-place
+  redraws, `clear`, `vi`, `htop`. It has no scrollback, because it is a screen.
+- **The log view is the history** — every line that ever arrived, timestamped.
+  `<prefix> c` switches between them at any time.
+- **Both are fed at all times**, including the hidden one. A view that only began
+  tracking when you looked at it would open blank, which is exactly the moment
+  you need it. Measured cost of feeding `pyte`: 1.19 MB/s, i.e. ~1% of a core at
+  115200 baud and ~9% at 921600 — bounded, and worth it for a view that is
+  correct the instant it appears.
+- **Redrawing is skipped unless something moved**, cursor included: moving the
+  cursor need not dirty a line, and a cursor drawn in the wrong place is very
+  visible.
+- `<prefix> k` **clears the screen, not the history** — that is what `clear`
+  means at a prompt, and the log behind it is the record.
+- Notes (`<prefix> ?`, mode changes) are written to the log as always, *and*
+  raised as a toast while the log is hidden behind the screen — one toast per
+  block, not one per line.
+
+Three things it deliberately does not do:
+
+- **TX is not echoed into the screen.** The far end echoes what you type, which
+  is why your keystrokes appear at all. Drawing them locally as well would double
+  every character, and would show input that a device with echo off — a password
+  prompt — is deliberately hiding.
+- **The device is never told the window size.** RS-232 has no `SIGWINCH` and no
+  in-band way to send one, so the far end keeps whatever size it assumed and a
+  full-screen program paints to *that*. `screen` over serial has the same
+  limitation. The status bar therefore reports the emulated size (`screen
+  135×34`) so the value to set on the device (`stty rows 34 cols 135`) is never a
+  guess.
+- **No scrollback in the terminal view.** The log already holds all of it, with
+  timestamps, one keystroke away.
+
+Two details that are easy to get wrong, both pinned by test:
+
+- **`pyte`'s colour names are not Rich's.** ANSI 33 is `brown` to pyte and
+  `yellow` to Rich, which rejects `brown` outright; the bright variants lack
+  Rich's underscore; and `BG_AIXTERM[105]` is misspelled `bfightmagenta` in pyte
+  0.8.2. An unmapped name is an exception raised because a device printed in
+  colour, so the mapping is exhaustive over pyte's own tables.
+- **Shrinking a `pyte` screen clips from the top.** Right for a live terminal,
+  wrong for one squashed while hidden — a hidden widget reports 0×0, so the
+  screen would be crushed to a cell and come back with its opening rows gone. The
+  hidden screen is kept at the size of the region it will be drawn in (the log
+  occupies the same slot), and degenerate sizes are ignored rather than applied.
+
+**Acceptance**
+- Keystrokes echoed one at a time, slower than the idle flush, land side by side
+  on one row; the second row stays empty.
+- `BS` edits in place; `CR` repaints the row; `ESC [ 2J` + `ESC [ H` repaints the
+  screen; a double-width character does not shift the rest of its row.
+- Colour reaches the rendered text; every name in pyte's four colour tables
+  translates to one Rich accepts.
+- Nothing is redrawn when nothing moved; moving the cursor alone still counts.
+- Malformed escape sequences and invalid bytes never raise.
+- Through the Textual harness: the view follows the mode both ways; the screen
+  already holds what arrived while the log was showing; the log still holds what
+  arrived while the screen was showing; `<prefix> k` clears the screen and keeps
+  the log; the emulated size matches the widget; `<prefix> ?` is raised as one
+  toast when the log is hidden.
+- Against a **real interactive `bash`** on a pty
+  ([`examples/check_char_mode.py`](./examples/check_char_mode.py)): Tab completes
+  a filename in place, the typed command occupies one row rather than one per
+  character, `^C` abandons the line, colour survives, and ↑ recalls from the
+  shell's own history.

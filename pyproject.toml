@@ -33,6 +33,10 @@ dependencies = [
     # The Textual TUI is the default interactive experience, so it ships in
     # core — `pip install uart-proxy` is enough to run `uart-proxy connect`.
     "textual>=0.60",
+    # Terminal emulation for character mode (SPEC S20). Core for the same
+    # reason: without it an interactive shell cannot be rendered correctly,
+    # and character mode is how you talk to one.
+    "pyte>=0.8",
 ]
 
 [project.optional-dependencies]

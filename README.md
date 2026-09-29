@@ -104,12 +104,13 @@ In the TUI:
 | `Ctrl+T` | cycle timestamp display: none → relative → full |
 | `Ctrl+Y` | toggle hex view |
 | `Ctrl+K` | clear the log **and** reset the `Ctrl+W` copy range |
-| `Ctrl+Q` | quit |
+| `Ctrl+Q` | quit — **line mode only**; in character mode `Ctrl+Q` is XON and goes to the device, so quit with `Ctrl+] q` |
 | `Ctrl+]` | **command prefix** — see below (`Ctrl+] ?` lists the commands) |
 
 The status bar shows the connection state (`● live` / `○ waiting`), the port and
-baud (e.g. `… @ 115200 8N1`), the elapsed clock, byte counts, and whether the
-view is following the tail (`follow` / `paused ▲`).
+baud (e.g. `… @ 115200 8N1`), the elapsed clock, byte counts, the input mode,
+and whether the view is following the tail (`follow` / `paused ▲`) — or, in
+character mode, the size of the emulated screen (`screen 135×34`).
 
 #### Character mode, and the `Ctrl+]` prefix
 
@@ -123,6 +124,29 @@ Ctrl+] c        switch character ⇄ line mode
 uart-proxy connect --port … --input char     # or start in it
 ```
 
+Switching mode switches the **view** with it, because a shell echoes into a
+screen, not a log — and a log can only ever append a finished line:
+
+| | **line mode** | **character mode** |
+|---|---|---|
+| you type | a command, Enter sends it | every keystroke, as you press it |
+| you see | the timestamped log, line by line | the device's screen, emulated |
+| good for | reading output, copying, timestamps | logging in, Tab completion, `vi`, `htop` |
+
+Both are live the whole time, so `Ctrl+] c` never loses anything: the screen
+already holds what arrived while you were reading the log, and the log holds
+every line that scrolled off the screen. The screen has no scrollback of its own
+— that is what the log is, one keystroke away.
+
+Two things a serial line cannot do, so neither does this:
+
+* **Your own keystrokes are not drawn locally.** What you see is the device
+  echoing them back, which is why a password prompt correctly shows nothing.
+* **The device is never told the window size** — RS-232 has no `SIGWINCH`, and
+  `screen` over serial has the same limitation. A full-screen program paints to
+  whatever size the far end assumed; the status bar reports ours, so
+  `stty rows 34 cols 135` over there is never a guess.
+
 In character mode almost every key belongs to the device — including `Ctrl+C`,
 which no longer quits — so exactly **one** key is reserved as a command prefix:
 
@@ -133,6 +157,7 @@ which no longer quits — so exactly **one** key is reserved as a command prefix
 | `Ctrl+] q` | quit |
 | `Ctrl+] c` | switch character ⇄ line mode |
 | `Ctrl+] t` `y` `k` `w` `e` | timestamps · hex · clear · copy · select mode |
+| | (`k` in character mode clears the **screen**; the log behind it is kept) |
 | `Ctrl+] Ctrl+]` | send a literal `Ctrl+]` to the device |
 
 **Why `Ctrl+]`?** It is telnet's escape, picked there for this exact problem. The

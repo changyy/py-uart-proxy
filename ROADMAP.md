@@ -73,6 +73,19 @@ The seven original requirements, implemented end to end.
   `on_key` and that the app survives it; character mode also stands the app's own
   priority bindings down (`check_action`) so `Ctrl+W` reaches the shell.
   - 💡 Surface mirror count / dropped bytes in the TUI status bar.
+- ✅ **The terminal view** (SPEC S20): character mode now renders device output
+  through a real terminal emulator (`pyte`), so Tab completion, backspace, `\r`
+  repaints, ANSI colour, `clear`, `vi` and `htop` all behave. S19 had fixed only
+  the input half; output was still a log of finished lines, and the session's
+  0.2s idle flush turned every echoed keystroke into a row of its own — `ls`
+  arrived as two lines. The screen is the device *now*, the log is the
+  timestamped history, `<prefix> c` switches, and both are fed at all times.
+  Verified against a real interactive `bash` on a pty by
+  [`examples/check_char_mode.py`](./examples/check_char_mode.py).
+  - 💡 Offer the terminal view in line mode too (a split, or a toggle
+    independent of the input mode) — the emulator already tracks either way.
+  - 💡 Tell the device the window size where the transport can carry it: a
+    remote proxy client could send one, even though RS-232 cannot.
 - ⬜ **Port-busy hint**: when opening a port fails because another process holds
   it (UART is exclusive-open — and now doubly so, since we claim it ourselves),
   detect this and suggest attaching via `uart-proxy remote` or a PTY mirror

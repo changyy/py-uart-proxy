@@ -1,5 +1,65 @@
 # Changelog
 
+## [1.20260929.1214712] — 2026-09-29
+
+Character mode became a terminal, not just a keyboard.
+
+### Added
+- **A real terminal view for character mode** (SPEC S20) — device output is now
+  rendered by a terminal emulator (`pyte`) while character mode is active, and
+  the view switches with the mode.
+  - This fixes what made character mode look broken: **one typed character per
+    row**. The session force-flushes a partial RX line after 0.2s of silence so a
+    prompt without a newline (`login: `) shows up at all — and at typing speed
+    every echoed keystroke cleared that timer on its own, so `ls` arrived as two
+    rows. A log can only append a finished line; a shell talks to a screen.
+  - Tab completion, `^C`, backspace, `\r` repaints, ANSI colour, `clear`, `vi`
+    and `htop` all behave, because the cursor can now move.
+  - The division is clean: the **screen** is the device now, the **log** is the
+    timestamped history, and `<prefix> c` switches. Both are fed at all times — a
+    view that only started tracking when you looked at it would open blank — at a
+    measured 1.19 MB/s, about 1% of a core at 115200 baud.
+  - `<prefix> k` clears the **screen** and keeps the log, which is what `clear`
+    means at a prompt. Notes are still written to the log and additionally
+    raised as a toast while it is hidden, one per block rather than one per line.
+  - The status bar reports the emulated size (`screen 135×34`). A serial line
+    cannot carry a window size — RS-232 has no `SIGWINCH`, and `screen` over
+    serial has the same limitation — so that is the number to set on the device
+    with `stty rows 34 cols 135`.
+  - TX is deliberately **not** echoed into the screen: the far end echoes what
+    you type, so drawing it locally too would double every character and would
+    show what a password prompt is deliberately hiding.
+  - [`examples/check_char_mode.py`](./examples/check_char_mode.py) checks all of
+    this against a **real interactive `bash`** on a pty with no hardware — Tab
+    really completes, in place; `^C` abandons the line; ↑ recalls from the
+    shell's own history — so it works as a smoke test as well as a demonstration.
+- `pyte>=0.8` is now a core dependency, for the same reason `textual` is: without
+  it character mode cannot render a shell, and talking to a shell is what
+  character mode is for.
+
+### Fixed
+- **The footer offered `Ctrl+Q` “Quit” in character mode, where it does not
+  quit.** `Ctrl+Q` is XON and belongs to the device, so `on_key` already sent it
+  down the wire — but the binding stayed in the footer, so pressing it did
+  nothing visible and left you believing you had quit. The session then carried
+  on running with the port still claimed under `TIOCEXCL`, which looks exactly
+  like a leak the next time you connect. `quit` and `follow_bottom` now stand
+  down with the other bindings in character mode, and the status bar carries the
+  quit hint (`char (Ctrl+] c · Ctrl+] q quit)`) since it is then the only thing
+  on screen that says how to leave.
+- **A hidden screen could come back with its opening rows missing.** `pyte` clips
+  from the *top* when it shrinks — correct for a live terminal — and a hidden
+  widget reports 0×0, so the screen was being crushed to a single cell and then
+  restored at the real size with the first rows gone. The hidden screen is now
+  kept at the size of the region it will be drawn in, and degenerate sizes are
+  ignored rather than applied.
+- **Colour from the device could raise instead of render.** `pyte` and Rich
+  disagree about colour names — ANSI 33 is `brown` to one and `yellow` to the
+  other, which rejects `brown` outright; the bright variants lack Rich's
+  underscore; and `BG_AIXTERM[105]` is misspelled `bfightmagenta` in pyte 0.8.2.
+  The mapping is now exhaustive over pyte's own tables, with a test that fails if
+  pyte ever adds a name Rich does not know.
+
 ## [1.20260731.1204419] — 2026-07-31
 
 Share one physical UART with several local tools — and stop anyone taking it by

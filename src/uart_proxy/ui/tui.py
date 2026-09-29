@@ -5,7 +5,8 @@ Layout (top to bottom):
 
     Header
     Status bar      source · role · live elapsed clock · RX/TX byte counts
-    RichLog         scrolling, line-by-line view with optional timestamps
+    RichLog         the timestamped log, line by line          (line mode)
+    TerminalView    the device's screen, emulated               (character mode)
     Input           type here, Enter sends (with the configured line ending)
     Footer          key bindings
 
@@ -15,6 +16,12 @@ Input has two modes, because a serial console needs both:
 * **character** — every keystroke goes straight to the device, so ``^C``
   interrupts, Tab completes and ↑ reaches the shell's history. This is what a
   serial terminal normally does.
+
+Switching mode switches the *view* with it, because the two halves cannot be
+separated: a shell echoes into a screen, not a log, and a log can only append.
+Character mode therefore shows a real terminal emulation of what the device has
+drawn; line mode shows the timestamped history. Both are fed from the same bus,
+so ``<prefix> c`` never loses anything — see :mod:`uart_proxy.ui.terminal`.
 
 Character mode can only work if *every* key reaches the app, so it moves focus off
 the Input widget (a focused Input swallows printable keys) and ``check_action``
@@ -44,6 +51,7 @@ from ..core.events import Direction, Event, EventKind
 from ..core.session import UartSession
 from ..core.timestamp import format_elapsed
 from .keymap import DEFAULT_PREFIX, key_to_bytes, prefix_label
+from .terminal import PYTE_AVAILABLE, TerminalEmulator
 
 try:
     from textual.app import App, ComposeResult
@@ -112,6 +120,45 @@ if _TEXTUAL_AVAILABLE:
         def following(self) -> bool:
             return self.auto_scroll
 
+    class TerminalView(Static):
+        """The device's screen, drawn by a real terminal emulator.
+
+        A thin wrapper: :class:`~uart_proxy.ui.terminal.TerminalEmulator` does the
+        emulation, this gives it a size and puts it on screen. Repainting rides
+        the same timer that drains the event queue and is skipped entirely unless
+        something moved, so a quiet device costs nothing.
+        """
+
+        def __init__(self, **kwargs) -> None:
+            super().__init__("", **kwargs)
+            self.emulator = TerminalEmulator()
+
+        def on_resize(self, event) -> None:
+            # The emulated screen is always exactly the size of the widget. The
+            # device is not told (RS-232 has no SIGWINCH), so it keeps drawing to
+            # whatever size it assumed; the status bar reports ours so the size
+            # to set over there with `stty` is never a guess.
+            #
+            # A hidden widget reports 0x0, and the screen keeps tracking while it
+            # is hidden — squashing it to a single cell would throw away exactly
+            # the output that <prefix> c exists to reveal. No real terminal is
+            # that small, so a degenerate size means "not on screen", not "resize".
+            if event.size.width < 2 or event.size.height < 2:
+                return
+            self.emulator.resize(event.size.width, event.size.height)
+            self.repaint(force=True)
+
+        def feed(self, data: bytes) -> None:
+            self.emulator.feed(data)
+
+        def repaint(self, *, force: bool = False) -> None:
+            if force or self.emulator.dirty:
+                self.update(self.emulator.render())
+
+        @property
+        def geometry_label(self) -> str:
+            return f"{self.emulator.columns}×{self.emulator.lines}"
+
     class UartProxyApp(App):
         CSS = """
         Screen { layout: vertical; }
@@ -125,6 +172,7 @@ if _TEXTUAL_AVAILABLE:
            terminal's own selection when copying. The status bar above already
            separates the log visually. */
         #log { height: 1fr; }
+        #term { height: 1fr; }
         #cmd { dock: bottom; }
         """
 
@@ -173,6 +221,10 @@ if _TEXTUAL_AVAILABLE:
             self._hex = False
             self._select_mode = False
             self._log: Optional[FollowLog] = None
+            # None when pyte is missing: character mode still forwards keys, it
+            # just cannot draw a screen, and says so rather than silently
+            # falling back to a view that is wrong for it.
+            self._term: Optional["TerminalView"] = None
             self._status: Optional[_StatusBar] = None
             self._unsubscribe = None
             # Events from any thread land here; the UI drains them on a timer.
@@ -189,6 +241,8 @@ if _TEXTUAL_AVAILABLE:
             yield self._status
             with Vertical():
                 yield FollowLog(id="log", highlight=False, markup=True, wrap=True, auto_scroll=True)
+                if PYTE_AVAILABLE:
+                    yield TerminalView(id="term")
             placeholder = (
                 "Type and press Enter to send…"
                 if self.session.source.writable
@@ -203,6 +257,8 @@ if _TEXTUAL_AVAILABLE:
             self.title = self._title
             self.sub_title = f"v{__version__}"
             self._log = self.query_one("#log", FollowLog)
+            if PYTE_AVAILABLE:
+                self._term = self.query_one("#term", TerminalView)
             # History first, so it sits above the live tail in the right order.
             self._write_history()
             # Subscribe BEFORE start() so the "connected" status is captured.
@@ -213,9 +269,12 @@ if _TEXTUAL_AVAILABLE:
             # Make sure typing goes where the current mode needs it: the input
             # box in line mode, the log in character mode (a focused Input eats
             # printable keys before on_key ever sees them).
+            self._show_view()
+            # Layout is not settled yet, so the first honest size arrives here.
+            self.call_after_refresh(self._sync_terminal_size)
             if self._char_mode or not self.session.source.writable:
                 self.query_one("#cmd", Input).disabled = True
-                self._log.focus()
+                self._defocus_input()
             else:
                 self.query_one("#cmd", Input).focus()
             self._note(f"{self._prefix_label} is the command prefix "
@@ -276,8 +335,17 @@ if _TEXTUAL_AVAILABLE:
                 except IndexError:
                     break
                 self._render_event(event)
+            if self._term is not None and self._term.display:
+                self._term.repaint()
 
         def _render_event(self, event: Event) -> None:
+            # Fed whether or not the terminal is the view on screen: <prefix> c
+            # has to reveal the device's screen as it is *now*, and a view that
+            # only started tracking when you looked at it would open blank.
+            # Measured at 1.19 MB/s, i.e. ~1% of a core at 115200 baud.
+            if (self._term is not None and event.kind == EventKind.DATA
+                    and event.direction == Direction.RX):
+                self._term.feed(event.data)
             if self._log is None:
                 return
             if event.kind == EventKind.LINE:
@@ -318,9 +386,68 @@ if _TEXTUAL_AVAILABLE:
             # RichLog markup is on; escape Rich's markup brackets.
             return text.replace("[", "\\[")
 
+        # ── views ────────────────────────────────────────────
+
+        def _terminal_showing(self) -> bool:
+            """Whether the emulated screen is the view currently covering the log."""
+            return self._term is not None and self._term.display
+
+        def _show_view(self) -> None:
+            """Put the view that belongs to the current input mode on screen.
+
+            Exactly one is visible; the hidden one keeps receiving everything, so
+            switching is instant and never shows a gap where the other view was
+            not looking.
+            """
+            terminal = self._char_mode and self._term is not None
+            self._sync_terminal_size()
+            if self._term is not None:
+                self._term.display = terminal
+                if terminal:
+                    self._term.repaint(force=True)
+            if self._log is not None:
+                self._log.display = not terminal
+
+        def _sync_terminal_size(self) -> None:
+            """Keep the hidden screen the size of the region it will be drawn in.
+
+            A hidden widget has no size of its own, so the screen would keep
+            whatever size it was built with and only meet reality when it is
+            first shown — by which point it has output on it, and pyte drops
+            lines from the *top* when it shrinks. The first ``<prefix> c`` would
+            then reveal a screen with its opening rows missing.
+
+            The log occupies the same slot, so its size is the answer. Cheap
+            enough to call on the status timer: a resize to the size it already
+            is returns immediately.
+            """
+            if self._term is None or self._term.display:
+                return  # on screen: its own on_resize is authoritative
+            if self._log is None:
+                return
+            size = self._log.size
+            if size.width >= 2 and size.height >= 2:
+                self._term.emulator.resize(size.width, size.height)
+
+        def _defocus_input(self) -> None:
+            """Take focus off the Input, which would otherwise swallow keys.
+
+            Focus goes to whichever view is showing. The terminal is a Static and
+            not focusable, so there it is cleared entirely — with no focused
+            widget the App itself receives the keys, which is what character mode
+            needs.
+            """
+            if self._log is not None and self._log.display:
+                self._log.focus()
+            else:
+                self.set_focus(None)
+
         # ── status bar ─────────────────────────────────────────────────────────
 
         def _refresh_status(self) -> None:
+            # Also the moment to notice the window changed while the screen was
+            # hidden; see _sync_terminal_size for why that cannot wait.
+            self._sync_terminal_size()
             if self._status is None:
                 return
             if self._select_mode:
@@ -334,7 +461,12 @@ if _TEXTUAL_AVAILABLE:
             role = ""
             if not self.session.source.writable:
                 role = " · [red]READ-ONLY[/red]"
-            if self._log is not None and self._log.following:
+            if self._terminal_showing():
+                # Follow/paused says nothing about a screen. The size does, and
+                # it is the one the device was never told — so it is also the
+                # answer to "what should I set over there with stty?".
+                follow = f"[cyan]screen {self._term.geometry_label}[/cyan]"
+            elif self._log is not None and self._log.following:
                 follow = "[green]follow[/green]"
             else:
                 follow = "[yellow]paused ▲[/yellow]"
@@ -342,7 +474,11 @@ if _TEXTUAL_AVAILABLE:
             if self._awaiting_command:
                 mode = f"[black on yellow] {self._prefix_label} … [/]"
             elif self._char_mode:
-                mode = f"[cyan]char[/cyan] ({self._prefix_label} c)"
+                # The quit hint earns its place here: Ctrl+Q is XON in this
+                # mode and the footer no longer offers it, so this is the only
+                # thing on screen that says how to leave.
+                mode = (f"[cyan]char[/cyan] ({self._prefix_label} c"
+                        f" · {self._prefix_label} q quit)")
             else:
                 mode = f"line ({self._prefix_label} c)"
             if self.session.is_connected:
@@ -371,6 +507,14 @@ if _TEXTUAL_AVAILABLE:
             self._refresh_status()
 
         def action_clear_log(self) -> None:
+            # In character mode what is on screen is the device's screen, so
+            # clear *that* — the log behind it is the history and throwing it
+            # away is not what `clear` means at a shell prompt.
+            if self._terminal_showing():
+                self._term.emulator.reset()
+                self._term.repaint(force=True)
+                self.notify("Screen cleared (the log behind it is kept).", timeout=3)
+                return
             # Clear both the visible log AND the copy buffer, so the range that
             # Ctrl+W copies is reset too (clear → accumulate → Ctrl+W copies
             # just the new range).
@@ -461,8 +605,16 @@ if _TEXTUAL_AVAILABLE:
 
         #: Bindings that must get out of the way in character mode, because the
         #: keys belong to the device then. Reachable via the prefix either way.
+        #:
+        #: ``quit`` and ``follow_bottom`` are here for the footer rather than for
+        #: the keys: ``on_key`` already consumes them in character mode, so
+        #: ``Ctrl+Q`` goes to the device as XON and ``End`` as its escape
+        #: sequence. Leaving them in the footer advertised a key that silently
+        #: did nothing — you press ``Ctrl+Q``, nothing happens, and the session
+        #: is left running with the port still claimed.
         _MODAL_ACTIONS = frozenset({
             "toggle_select", "cycle_ts", "toggle_hex", "clear_log", "copy_all",
+            "quit", "follow_bottom",
         })
 
         def check_action(self, action: str, parameters) -> bool:
@@ -501,8 +653,7 @@ if _TEXTUAL_AVAILABLE:
                 # command letter — printable keys go in the box and never bubble
                 # up to here. Park focus on the log for the one keystroke that
                 # follows, then give it back.
-                if self._log is not None:
-                    self._log.focus()
+                self._defocus_input()
                 self._note(f"{self._prefix_label} — d detach · q quit · c char/line "
                            f"· t time · y hex · k clear · w copy · ? help")
                 self._refresh_status()
@@ -559,19 +710,28 @@ if _TEXTUAL_AVAILABLE:
         def _toggle_input_mode(self) -> None:
             self._char_mode = not self._char_mode
             inp = self.query_one("#cmd", Input)
+            self._show_view()
             if self._char_mode:
                 # Focus has to leave the Input for printable keys to reach on_key.
                 inp.disabled = True
-                if self._log is not None:
-                    self._log.focus()
-                self._note("character mode — every key goes straight to the "
-                           f"device, including ^C. {self._prefix_label} c to go back")
+                self._defocus_input()
+                if self._term is not None:
+                    self._note("character mode — every key goes straight to the "
+                               "device, including ^C and ^Q, and the view is the "
+                               f"device's screen. {self._prefix_label} c for the "
+                               f"log again, {self._prefix_label} q to quit")
+                else:
+                    self._note("character mode — keys go straight to the device, "
+                               "but pyte is not installed, so output stays in the "
+                               "log view and a shell's redraws will look wrong. "
+                               "Install it with: pip install pyte")
             else:
                 inp.disabled = not self.session.source.writable
                 inp.placeholder = "Type and press Enter to send…"
                 if not inp.disabled:
                     inp.focus()
-                self._note("line mode — type a command and press Enter")
+                self._note("line mode — type a command and press Enter; "
+                           "the view is the timestamped log")
             self._refresh_status()
 
         def _quit(self) -> None:
@@ -591,21 +751,35 @@ if _TEXTUAL_AVAILABLE:
 
         def _show_help(self) -> None:
             p = self._prefix_label
-            for line in (
+            # One block, so character mode raises one toast rather than eight.
+            self._note_lines((
                 f"{p} is the command prefix. Everything else goes to the device.",
                 f"  {p} d   detach (leave a background session running)",
                 f"  {p} q   quit",
-                f"  {p} c   switch character / line input",
+                f"  {p} c   character / line input, and the view that goes with it",
                 f"  {p} t   timestamps    {p} y   hex    {p} k   clear",
                 f"  {p} w   copy log      {p} e   select mode",
                 f"  {p} {p.split('+')[-1]}   send a literal {p}",
-            ):
-                self._note(line)
+            ), timeout=12)
 
         def _note(self, text: str) -> None:
-            if self._log is not None:
-                self._log.write(f"[yellow]* {self._escape(text)}[/yellow]")
-                self._copy_lines.append(f"* {text}")
+            self._note_lines([text], timeout=4)
+
+        def _note_lines(self, lines, *, timeout: float = 8) -> None:
+            """Write related notes to the log, and surface them if it is hidden.
+
+            Notes always go to the log — that is the record, and what
+            ``Ctrl+W`` copies. But in character mode the log is behind the
+            terminal view, where a note would never be seen, so the set is also
+            raised as a single toast: one for the group, not one per line.
+            """
+            lines = list(lines)
+            for line in lines:
+                if self._log is not None:
+                    self._log.write(f"[yellow]* {self._escape(line)}[/yellow]")
+                    self._copy_lines.append(f"* {line}")
+            if self._terminal_showing():
+                self.notify("\n".join(lines), timeout=timeout)
 
         def on_input_submitted(self, message: "Input.Submitted") -> None:
             text = message.value

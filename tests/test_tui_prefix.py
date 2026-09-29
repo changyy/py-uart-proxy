@@ -278,3 +278,61 @@ def test_the_default_prefix_is_the_documented_one():
     app, session, _ = _app()
     assert app._prefix == DEFAULT_PREFIX
     assert app._prefix_label == "Ctrl+]"
+
+
+def test_ctrl_q_reaches_the_device_in_character_mode():
+    """``Ctrl+Q`` is XON. A serial console has to be able to send it, so in
+    character mode it must not be the app's quit key."""
+    async def scenario():
+        app, session, source = _app(input_mode="char")
+        async with app.run_test() as pilot:
+            await _settle(pilot)
+            await pilot.press("ctrl+q")
+            await _settle(pilot)
+            assert b"\x11" in b"".join(source.writes)
+            assert app.is_running, "ctrl+q quit instead of going to the wire"
+        session.stop()
+
+    _run(scenario())
+
+
+def test_end_reaches_the_device_in_character_mode():
+    """``End`` is an escape sequence a shell's line editor uses; the app's own
+    follow-the-tail binding must not intercept it here."""
+    async def scenario():
+        app, session, source = _app(input_mode="char")
+        async with app.run_test() as pilot:
+            await _settle(pilot)
+            await pilot.press("end")
+            await _settle(pilot)
+            assert b"\x1b[F" in b"".join(source.writes)
+        session.stop()
+
+    _run(scenario())
+
+
+def test_character_mode_does_not_advertise_keys_it_gave_away():
+    """The footer must not promise what the mode has handed to the device.
+
+    This is not cosmetic. ``Ctrl+Q`` in character mode is XON: pressing it does
+    nothing visible, so a footer still offering "Quit" leaves you believing you
+    quit while the session runs on holding the port exclusively.
+    """
+    async def scenario():
+        for mode, expected in (("line", True), ("char", False)):
+            app, session, _ = _app(input_mode=mode)
+            async with app.run_test() as pilot:
+                await _settle(pilot)
+                offered = {
+                    key for key, active in app.screen.active_bindings.items()
+                    if getattr(active, "enabled", True)
+                    and active.binding.action in app._MODAL_ACTIONS
+                }
+                assert ("ctrl+q" in offered) is expected, (
+                    f"{mode} mode: footer offered {sorted(offered)}"
+                )
+                if mode == "char":
+                    assert not offered, "character mode still advertises app keys"
+            session.stop()
+
+    _run(scenario())
