@@ -206,9 +206,11 @@ class TelnetServer:
             self.conn = None
 
     def drop(self):
-        if self.conn is not None:
-            self.conn.shutdown(socket.SHUT_RDWR)
-            self.conn.close()
+        # The serving thread clears self.conn as soon as shutdown() wakes it.
+        conn = self.conn
+        if conn is not None:
+            conn.shutdown(socket.SHUT_RDWR)
+            conn.close()
 
     def close(self):
         self.drop()
