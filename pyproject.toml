@@ -62,3 +62,7 @@ packages = ["src/uart_proxy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_ports: let an in-process test scan this machine's real serial ports",
+    "real_daemonize: let an in-process test really detach a daemon",
+]

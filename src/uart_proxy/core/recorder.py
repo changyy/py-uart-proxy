@@ -12,6 +12,10 @@ Subscribes to the event bus and writes up to three files for a session:
 
 TX lines (what the operator typed) can optionally be mirrored into the
 timestamped files with a ``>>`` marker via ``include_tx``.
+
+The two timestamped files open and close with ``#`` comment lines saying what
+was recorded — version, port and settings, and the time window (SPEC S25). The
+raw ``.log`` never gets one: it is the device's bytes and nothing else.
 """
 
 from __future__ import annotations
@@ -70,6 +74,17 @@ class Recorder:
         elif event.direction == Direction.TX and self._include_tx:
             if event.kind == EventKind.LINE:
                 self._write_line(event, marker=">> ")
+
+    def mark(self, text: str) -> None:
+        """Write ``# text`` into the timestamped files (never the raw log).
+
+        ``#`` because a device line is always prefixed ``[stamp]``, so a
+        comment line can never be mistaken for one.
+        """
+        for f in (self._rel_f, self._full_f):
+            if f is not None:
+                f.write(f"# {text}\n")
+                f.flush()
 
     def _write_line(self, event: Event, marker: str) -> None:
         if self._rel_f is not None:

@@ -215,6 +215,9 @@ def test_start_status_stop(tmp_path, isolated_home):
         host, _, port = data[0]["listen"].partition(":")
         assert host == "127.0.0.1" and int(port) > 0
 
+        # …and so must the banner, which the launching process prints.
+        assert f"127.0.0.1:{port} " in started.stderr, started.stderr
+
         stopped = _cli("stop", "probe", home=isolated_home)
         assert stopped.returncode == 0 and "stopped" in stopped.stdout
         assert list_daemons() == []
@@ -290,10 +293,19 @@ def test_an_absent_device_is_not_a_startup_failure(tmp_path, isolated_home):
         _cli("stop", "--all", home=isolated_home)
 
 
+def test_headless_without_reconnect_exits_when_the_device_is_absent(
+        tmp_path, isolated_home):
+    """It used to wait forever: the manager gave up without saying so."""
+    result = _cli("connect", "--port", "/dev/cu.nothing-here", "--no-tui",
+                  "--no-log", "--no-reconnect", home=isolated_home)
+    assert result.returncode == 0
+    assert "disconnected" in result.stdout
+
+
 def test_status_says_something_useful_when_nothing_runs(isolated_home):
     result = _cli("status", home=isolated_home)
     assert result.returncode == 0
-    assert "No background session" in result.stdout
+    assert "No session is running" in result.stdout
     assert "uart-proxy start" in result.stdout
 
 

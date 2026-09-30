@@ -17,6 +17,7 @@ from typing import Optional
 
 from uart_helper import PortIdentity, UARTConfig, UARTDevice
 
+from ..core.port_busy import is_busy_error
 from .source import DataSource
 
 logger = logging.getLogger(__name__)
@@ -81,9 +82,17 @@ class UartSource(DataSource):
         self._exclusive = exclusive
         self._dev = UARTDevice(PortIdentity(device=self._device_path), self._config)
         self.is_exclusive = False  # what we actually got, for status display
+        #: Whether the last open() failed because another process holds the
+        #: port (SPEC S21), as opposed to it being absent or not permitted.
+        self.busy = False
 
     def open(self) -> None:
-        self._dev.open()
+        try:
+            self._dev.open()
+        except Exception as exc:
+            self.busy = is_busy_error(exc)
+            raise
+        self.busy = False
         self.is_exclusive = False
         if self._exclusive:
             fd = self._fileno()

@@ -23,6 +23,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
+from ..io.source import SourceRefused
 from .bus import EventBus
 from .events import Direction, Event, EventKind
 from .line_assembler import LineAssembler
@@ -59,13 +60,18 @@ class UartSession:
         self.reconnect_interval = reconnect_interval
 
         self._rx_asm = LineAssembler()
-        self._tx_asm = LineAssembler()
+        # What is typed ends a line on Enter, and Enter is often a bare \r.
+        self._tx_asm = LineAssembler(cr_ends_line=True)
         self._seq = itertools.count(1)
 
         self._conn_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._running = False     # session is active (start..stop)
         self._connected = False   # source is currently open
+        # Guards the running -> stopped transition, which either stop() or the
+        # manager giving up on its own can make, and which must be announced
+        # exactly once.
+        self._end_lock = threading.Lock()
 
         self.rx_bytes = 0
         self.tx_bytes = 0
@@ -89,13 +95,20 @@ class UartSession:
 
     def stop(self) -> None:
         """Stop the session, flush any partial line, and close the source."""
-        if not self._running:
+        if not self._end():
             return
-        self._running = False
         self._stop.set()
         if self._conn_thread is not None:
             self._conn_thread.join(timeout=3.0)
         self._publish_status("disconnected", {})
+
+    def _end(self) -> bool:
+        """Mark the session stopped; True for whichever caller got there first."""
+        with self._end_lock:
+            if not self._running:
+                return False
+            self._running = False
+            return True
 
     @property
     def is_running(self) -> bool:
@@ -109,19 +122,37 @@ class UartSession:
 
     def _run_manager(self) -> None:
         """Open → read → (on drop) reconnect, until stop()."""
+        # A missing device is retried every reconnect_interval, possibly for
+        # hours; one `waiting` line per attempt would bury everything else, so
+        # it is repeated only when the reason changes (absent -> busy, say).
+        last_wait: Optional[str] = None
+        refused = False
         while not self._stop.is_set():
             try:
                 self.source.open()
-            except Exception as exc:  # noqa: BLE001 - any open failure is retryable
+            except SourceRefused as exc:
+                # Refused, not absent: the same answer every time, and against a
+                # rate-limited proxy a retry loop gets our own address banned.
                 self._publish_status(
-                    "waiting",
-                    {"source": self.source.description(), "error": str(exc)},
+                    "error",
+                    {"source": self.source.description(), "error": str(exc),
+                     "refused": True},
                 )
+                refused = True
+                break
+            except Exception as exc:  # noqa: BLE001 - any other open failure is retryable
+                if str(exc) != last_wait:
+                    last_wait = str(exc)
+                    self._publish_status(
+                        "waiting",
+                        {"source": self.source.description(), "error": last_wait},
+                    )
                 if not self.auto_reconnect:
                     break
                 self._stop.wait(self.reconnect_interval)
                 continue
 
+            last_wait = None
             self._connected = True
             self._publish_status("connected", {"source": self.source.description()})
 
@@ -140,7 +171,11 @@ class UartSession:
             self._stop.wait(self.reconnect_interval)
 
         self._connected = False
-        self._running = False
+        # Gave up on its own (no auto-reconnect): say so, or a UI waiting for
+        # the session to end — headless mode — would wait forever.
+        if self._end():
+            self._publish_status("disconnected",
+                                 {"reason": "refused" if refused else "gave up"})
 
     # ── read path ──────────────────────────────────────────────────────────
 
@@ -232,6 +267,24 @@ class UartSession:
                 seq=next(self._seq),
                 text=state,
                 meta=meta,
+            )
+        )
+
+    def publish_remote_tx(self, text: str) -> None:
+        """Show a line someone else typed into the device (SPEC S29).
+
+        A TX line like our own, so the log and ``--log-tx`` treat it the same —
+        but nothing is written: it already reached the device, through the
+        proxy we are a client of.
+        """
+        self._emit(
+            Event(
+                kind=EventKind.LINE,
+                direction=Direction.TX,
+                stamp=self.tracker.stamp(),
+                seq=next(self._seq),
+                text=text,
+                meta={"remote": True},
             )
         )
 

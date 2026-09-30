@@ -36,7 +36,15 @@ Server replies with exactly one of:
 {"type": "auth_fail", "reason": "invalid code"}
 ```
 
-On `auth_fail` the server closes the connection.
+On `auth_fail` the server closes the connection. If it carries
+`"retry": true` — uart-proxy sends it as `server full (N connections)` — the
+refusal is temporary and a client should retry; without it, retrying with the
+same code cannot succeed. `reason` is for people, not
+for parsing; uart-proxy sends `invalid code`, `bad message`, `expected auth`,
+and — once an address has failed too often — `too many failed attempts; try
+again in <N>s`, sent straight after connecting, before any `auth` is read. A
+client should not retry blindly on `auth_fail`: every retry with a wrong code
+counts towards that refusal.
 
 - `replay` (optional, client) — ask for up to N lines of recent history before the
   live stream starts. Omit it, or send `0`, for live only.
@@ -89,8 +97,14 @@ mode (e.g. a mobile viewer).
 {"type": "rx", "seq": 12, "wall": "2026-06-12 08:40:20", "elapsed": 10.0042, "hex": "48656c6c6f", "text": "Hello"}
 {"type": "notice", "text": "grep[ERROR] #1: ...", "meta": {}}
 {"type": "status", "state": "connected", "meta": {}}
+{"type": "tx_echo", "seq": 13, "wall": "2026-06-12 08:40:21", "elapsed": 11.2, "text": "reboot"}
 {"type": "pong"}
 ```
+
+- `tx_echo` (optional) — a line someone typed into the device, sent only when
+  the server runs with `--echo-tx`, and never to the client that typed it. A
+  client shows it; it must **not** write it (it already reached the device).
+  Clients that don't know it should ignore it, as with any unknown `type`.
 
 - `rx` — device output, **live only**. `hex` is authoritative (raw bytes); `text`
   is a UTF-8 best-effort decode for display. `wall` is the server's local time

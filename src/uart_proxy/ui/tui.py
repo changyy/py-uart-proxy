@@ -44,11 +44,12 @@ import shutil
 import subprocess
 import sys
 from collections import deque
-from typing import Optional
+from typing import Callable, Optional
 
 from .. import __version__
 from ..core.events import Direction, Event, EventKind
 from ..core.session import UartSession
+from ..core.retention import format_bytes
 from ..core.timestamp import format_elapsed
 from .keymap import DEFAULT_PREFIX, key_to_bytes, prefix_label
 from .terminal import PYTE_AVAILABLE, TerminalEmulator
@@ -174,6 +175,7 @@ if _TEXTUAL_AVAILABLE:
         #log { height: 1fr; }
         #term { height: 1fr; }
         #cmd { dock: bottom; }
+        #find { dock: bottom; display: none; }
         """
 
         # priority=True so these app controls win even while the Input box has
@@ -200,11 +202,20 @@ if _TEXTUAL_AVAILABLE:
             prefix: str = DEFAULT_PREFIX,
             input_mode: str = "line",
             detachable: bool = False,
+            info: Optional[list[str]] = None,
+            serve_hint: Optional[str] = None,
+            mirror_stats: Optional[Callable[[], list]] = None,
         ) -> None:
             super().__init__()
             self.session = session
             self._title = title
             self._log_hint = log_hint
+            # `<prefix> i`: how to reach this session, auth codes included
+            # (SPEC S23). Never written to the log — see _show_info.
+            self._info = list(info or [])
+            self._serve_hint = serve_hint
+            # PTY mirrors (S14): how many, and whether a reader is losing data.
+            self._mirror_stats = mirror_stats
             # The one reserved key. Everything else can then be given to the
             # device in character mode (see _handle_char_key).
             self._prefix = prefix
@@ -232,6 +243,10 @@ if _TEXTUAL_AVAILABLE:
             # Plain-text mirror of what's shown, for clean clipboard copy
             # (no border, no padding, no markup).
             self._copy_lines: "deque[str]" = deque(maxlen=5000)
+            # The same lines as rendered, in lockstep, so the log can be rebuilt
+            # when a search filter (SPEC S28) is set or cleared.
+            self._log_markup: "deque[str]" = deque(maxlen=5000)
+            self._filter: Optional[str] = None
 
         # ── composition ─────────────────────────────────────────────────────
 
@@ -251,6 +266,8 @@ if _TEXTUAL_AVAILABLE:
             inp = Input(placeholder=placeholder, id="cmd")
             inp.disabled = not self.session.source.writable
             yield inp
+            yield Input(placeholder="search the log — Enter to filter, empty "
+                                    "Enter to clear, Esc to cancel", id="find")
             yield Footer()
 
         def on_mount(self) -> None:
@@ -298,15 +315,12 @@ if _TEXTUAL_AVAILABLE:
             from ..core.replay import describe
 
             header = f"── replayed {describe(self._history)} ──"
-            self._log.write(f"[dim]{self._escape(header)}[/dim]")
-            self._copy_lines.append(header)
+            self._append(f"[dim]{self._escape(header)}[/dim]", header)
             for entry in self._history:
                 prefix = self._history_prefix(entry)
                 plain = f"{prefix}< {entry.text}"
-                self._log.write(f"[dim]{self._escape(plain)}[/dim]")
-                self._copy_lines.append(plain)
-            self._log.write("[dim]── live ──[/dim]")
-            self._copy_lines.append("── live ──")
+                self._append(f"[dim]{self._escape(plain)}[/dim]", plain)
+            self._append("[dim]── live ──[/dim]", "── live ──")
 
         def _history_prefix(self, entry) -> str:
             mode = _TS_MODES[self._ts_index]
@@ -349,18 +363,16 @@ if _TEXTUAL_AVAILABLE:
             if self._log is None:
                 return
             if event.kind == EventKind.LINE:
-                markup, plain = self._format_line(event)
-                self._log.write(markup)
-                self._copy_lines.append(plain)
+                self._append(*self._format_line(event))
             elif event.kind == EventKind.NOTICE:
-                self._log.write(f"[yellow]* {self._escape(event.text)}[/yellow]")
-                self._copy_lines.append(f"* {event.text}")
+                self._append(f"[yellow]* {self._escape(event.text)}[/yellow]",
+                             f"* {event.text}")
             elif event.kind == EventKind.STATUS:
                 meta = f" {event.meta}" if event.meta else ""
-                self._log.write(
-                    f"[cyan]# {self._escape(event.text)}{self._escape(meta)}[/cyan]"
+                self._append(
+                    f"[cyan]# {self._escape(event.text)}{self._escape(meta)}[/cyan]",
+                    f"# {event.text}{meta}",
                 )
-                self._copy_lines.append(f"# {event.text}{meta}")
 
         def _format_line(self, event: Event) -> tuple[str, str]:
             """Return (markup_for_display, plain_for_clipboard)."""
@@ -471,6 +483,12 @@ if _TEXTUAL_AVAILABLE:
             else:
                 follow = "[yellow]paused ▲[/yellow]"
             rec = f" · rec→{self._escape(self._log_hint)}" if self._log_hint else " · rec off"
+            if self._serve_hint:
+                # Where, never the code: a status bar ends up in screenshots.
+                rec += (f" · serve {self._escape(self._serve_hint)}"
+                        f" ({self._prefix_label} i)")
+            rec += self._mirror_label()
+            rec += self._filter_label()
             if self._awaiting_command:
                 mode = f"[black on yellow] {self._prefix_label} … [/]"
             elif self._char_mode:
@@ -521,6 +539,7 @@ if _TEXTUAL_AVAILABLE:
             if self._log is not None:
                 self._log.clear()
             self._copy_lines.clear()
+            self._log_markup.clear()
             self.notify("Cleared (display + copy range).", timeout=2)
 
         def action_follow_bottom(self) -> None:
@@ -531,13 +550,16 @@ if _TEXTUAL_AVAILABLE:
         def action_copy_all(self) -> None:
             """Copy the whole in-memory log to the clipboard as clean text
             (no border, no padding, no markup)."""
-            text = "\n".join(self._copy_lines)
+            # What is shown: with a filter set, the matching lines only.
+            lines = [line for line in self._copy_lines if self._matches(line)]
+            text = "\n".join(lines)
             if not text:
                 self.notify("Nothing to copy yet.", timeout=2)
                 return
             via = self._copy_text(text)
+            which = f" matching {self._filter!r}" if self._filter else ""
             self.notify(
-                f"Copied {len(self._copy_lines)} lines to the clipboard ({via}).",
+                f"Copied {len(lines)} lines{which} to the clipboard ({via}).",
                 timeout=3,
             )
 
@@ -659,6 +681,11 @@ if _TEXTUAL_AVAILABLE:
                 self._refresh_status()
                 return
 
+            if event.key == "escape" and self.query_one("#find", Input).display:
+                event.stop()
+                self._close_find()
+                return
+
             if self._char_mode:
                 event.stop()
                 event.prevent_default()
@@ -666,6 +693,10 @@ if _TEXTUAL_AVAILABLE:
 
         def _restore_focus(self) -> None:
             """Put focus back where the current mode wants it."""
+            find = self.query_one("#find", Input)
+            if find.display:
+                find.focus()
+                return
             if self._char_mode or self._detached or not self.session.source.writable:
                 return
             inp = self.query_one("#cmd", Input)
@@ -683,6 +714,7 @@ if _TEXTUAL_AVAILABLE:
                 "c": self._toggle_input_mode, "t": self.action_cycle_ts,
                 "y": self.action_toggle_hex, "k": self.action_clear_log,
                 "w": self.action_copy_all, "e": self.action_toggle_select,
+                "i": self._show_info, "slash": self._open_find, "/": self._open_find,
                 "question_mark": self._show_help, "?": self._show_help,
             }.get(key)
             if command is None:
@@ -759,8 +791,121 @@ if _TEXTUAL_AVAILABLE:
                 f"  {p} c   character / line input, and the view that goes with it",
                 f"  {p} t   timestamps    {p} y   hex    {p} k   clear",
                 f"  {p} w   copy log      {p} e   select mode",
+                f"  {p} i   session info — proxy address and auth code",
+                f"  {p} /   search: show only the log lines that match",
                 f"  {p} {p.split('+')[-1]}   send a literal {p}",
             ), timeout=12)
+
+        # ── search (SPEC S28) ────────────────────────────────────────────────
+
+        def _append(self, markup: str, plain: str) -> None:
+            """Record one log line, and show it unless a filter hides it."""
+            self._log_markup.append(markup)
+            self._copy_lines.append(plain)
+            if self._log is None:
+                return
+            if self._filter is None:
+                self._log.write(markup)
+            elif self._matches(plain):
+                self._log.write(self._highlighted(plain))
+
+        def _matches(self, plain: str) -> bool:
+            """Smart case: case-insensitive unless the pattern has a capital."""
+            if self._filter is None:
+                return True
+            if self._filter != self._filter.lower():
+                return self._filter in plain
+            return self._filter in plain.lower()
+
+        def _highlighted(self, plain: str):
+            from rich.text import Text
+
+            text = Text(plain)
+            text.highlight_words([self._filter], style="black on yellow",
+                                 case_sensitive=self._filter != self._filter.lower())
+            return text
+
+        def _set_filter(self, pattern: str) -> None:
+            self._filter = pattern or None
+            self._rebuild_log()
+            if self._filter is None:
+                self._note("filter cleared — showing the whole log")
+            else:
+                count = sum(1 for line in self._copy_lines if self._matches(line))
+                self.notify(f"{count} line(s) match {self._filter!r} — "
+                            f"{self._prefix_label} / and an empty Enter to clear",
+                            timeout=4)
+            self._refresh_status()
+
+        def _rebuild_log(self) -> None:
+            if self._log is None:
+                return
+            self._log.clear()
+            for markup, plain in zip(self._log_markup, self._copy_lines):
+                if self._filter is None:
+                    self._log.write(markup)
+                elif self._matches(plain):
+                    self._log.write(self._highlighted(plain))
+            self._log.jump_to_bottom()
+
+        def _open_find(self) -> None:
+            if self._char_mode:
+                # Every key belongs to the device here, and the log is behind
+                # the device's screen: there is nothing to type a search into.
+                self._note(f"search works on the log — switch to line mode "
+                           f"first ({self._prefix_label} c)")
+                return
+            find = self.query_one("#find", Input)
+            # Empty, so an empty Enter really does clear: the current pattern
+            # goes in the placeholder instead of in the way.
+            find.value = ""
+            find.placeholder = (
+                f"filtering on {self._filter!r} — new pattern and Enter, empty "
+                f"Enter to clear, Esc to keep it" if self._filter else
+                "search the log — Enter to filter, Esc to cancel")
+            find.display = True
+            find.focus()
+
+        def _close_find(self) -> None:
+            find = self.query_one("#find", Input)
+            find.display = False
+            self._restore_focus()
+
+        def _filter_label(self) -> str:
+            if self._filter is None:
+                return ""
+            count = sum(1 for line in self._copy_lines if self._matches(line))
+            return (f" · [black on yellow] filter {self._escape(repr(self._filter))}"
+                    f" ({count}) [/]")
+
+        def _mirror_label(self) -> str:
+            """`` · mirrors 2``, and what a lagging reader has lost, if any.
+
+            Only ``dropped`` is worth alarm: it is a reader that is attached but
+            not keeping up. ``stale`` is output nobody was attached to read,
+            which is the normal state of an unused mirror.
+            """
+            if self._mirror_stats is None:
+                return ""
+            try:
+                stats = self._mirror_stats()
+            except Exception:  # noqa: BLE001 - status must never break the UI
+                return ""
+            label = f" · mirrors {len(stats)}"
+            dropped = sum(m.dropped for m in stats)
+            if dropped:
+                label += f" [red]dropped {format_bytes(dropped)}[/red]"
+            return label
+
+        def _show_info(self) -> None:
+            """Raise the session's connection details as a toast, and only that.
+
+            Unlike every other note this is not written to the log: the log is
+            what ``Ctrl+W`` copies and people paste into tickets, and the lines
+            carry the proxy's auth code.
+            """
+            lines = self._info or ["nothing to show — not serving (--serve)"]
+            self.notify("\n".join(lines), title="session", timeout=20)
 
         def _note(self, text: str) -> None:
             self._note_lines([text], timeout=4)
@@ -776,12 +921,17 @@ if _TEXTUAL_AVAILABLE:
             lines = list(lines)
             for line in lines:
                 if self._log is not None:
-                    self._log.write(f"[yellow]* {self._escape(line)}[/yellow]")
-                    self._copy_lines.append(f"* {line}")
+                    self._append(f"[yellow]* {self._escape(line)}[/yellow]",
+                                 f"* {line}")
             if self._terminal_showing():
                 self.notify("\n".join(lines), timeout=timeout)
 
         def on_input_submitted(self, message: "Input.Submitted") -> None:
+            if message.input.id == "find":
+                self._set_filter(message.value)
+                message.input.value = ""
+                self._close_find()
+                return
             text = message.value
             message.input.value = ""
             if not self.session.source.writable:
@@ -803,6 +953,9 @@ def run_tui(
     prefix: str = DEFAULT_PREFIX,
     input_mode: str = "line",
     detachable: bool = False,
+    info: Optional[list[str]] = None,
+    serve_hint: Optional[str] = None,
+    mirror_stats: Optional[Callable[[], list]] = None,
 ) -> None:
     """Launch the Textual TUI. Raises RuntimeError if textual isn't installed."""
     if not _TEXTUAL_AVAILABLE:
@@ -812,4 +965,5 @@ def run_tui(
         )
     UartProxyApp(session, title=title, ts_mode=ts_mode, log_hint=log_hint,
                  history=history, prefix=prefix, input_mode=input_mode,
-                 detachable=detachable).run()
+                 detachable=detachable, info=info, serve_hint=serve_hint,
+                 mirror_stats=mirror_stats).run()

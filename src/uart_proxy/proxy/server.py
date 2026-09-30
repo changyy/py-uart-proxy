@@ -22,7 +22,9 @@ import logging
 import queue
 import socket
 import threading
-from typing import TYPE_CHECKING, Optional
+import time
+from collections import deque
+from typing import TYPE_CHECKING, Callable, Optional
 
 from ..core.events import Direction, Event, EventKind
 from ..core.replay import ReplayBuffer
@@ -35,6 +37,71 @@ logger = logging.getLogger(__name__)
 
 _AUTH_TIMEOUT = 10.0       # seconds a client has to send its auth line
 _SEND_QUEUE_MAX = 10000    # per-client backlog before we drop the slowest client
+
+#: Failed auth attempts one address may make within ``FAIL_WINDOW`` seconds
+#: before it is refused for ``BAN_SECONDS`` (SPEC S22). Per address, and for a
+#: fixed time, rather than locking the server: a lockout for everyone is one a
+#: stranger on the LAN can trigger at will, against the people meant to use it.
+#: Connections served at once, authenticated or not (SPEC S26). Each one is two
+#: threads and a send queue; unauthenticated ones count too, or idle sockets
+#: that never send `auth` could hold every slot for their 10 s grace each.
+MAX_CLIENTS = 16
+
+MAX_AUTH_FAILURES = 10
+FAIL_WINDOW = 60.0
+BAN_SECONDS = 600.0
+
+
+class AuthLimiter:
+    """Counts failed auth attempts per address and refuses repeat offenders."""
+
+    def __init__(
+        self,
+        *,
+        max_failures: int = MAX_AUTH_FAILURES,
+        window: float = FAIL_WINDOW,
+        ban: float = BAN_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.max_failures = max_failures
+        self.window = window
+        self.ban = ban
+        self._clock = clock
+        self._failures: dict[str, deque[float]] = {}
+        self._banned_until: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def banned_for(self, address: str) -> float:
+        """Seconds ``address`` is still refused for; 0 if it may try."""
+        with self._lock:
+            until = self._banned_until.get(address)
+            if until is None:
+                return 0.0
+            remaining = until - self._clock()
+            if remaining <= 0:
+                del self._banned_until[address]
+                return 0.0
+            return remaining
+
+    def record_failure(self, address: str) -> bool:
+        """Count one failure; True if this one got ``address`` refused."""
+        with self._lock:
+            now = self._clock()
+            recent = self._failures.setdefault(address, deque())
+            recent.append(now)
+            while recent and now - recent[0] > self.window:
+                recent.popleft()
+            if len(recent) < self.max_failures:
+                return False
+            del self._failures[address]
+            self._banned_until[address] = now + self.ban
+            return True
+
+    def record_success(self, address: str) -> None:
+        """A right code clears the slate: a typo or two is not an attack."""
+        with self._lock:
+            self._failures.pop(address, None)
+
 
 
 class _Client:
@@ -110,9 +177,22 @@ class ProxyServer:
         host: str = "0.0.0.0",
         port: int = 9600,
         replay: Optional[ReplayBuffer] = None,
+        limiter: Optional[AuthLimiter] = None,
+        max_clients: int = MAX_CLIENTS,
+        echo_tx: bool = False,
     ) -> None:
         self.session = session
         self.auth = auth
+        self.limiter = limiter or AuthLimiter()
+        self.max_clients = max_clients
+        # Forward typed lines to clients as `tx_echo` (SPEC S29). Off by
+        # default: a line typed at a password prompt is still a line.
+        self.echo_tx = echo_tx
+        # Which client's `tx` is being written right now, on this thread — so
+        # its own line is not echoed back to it (it already shows it).
+        self._origin = threading.local()
+        self._active = 0          # connections being served, authed or not
+        self._active_lock = threading.Lock()
         self.host = host
         self.port = port
         # Optional history, so an attaching client can be shown what it missed.
@@ -174,14 +254,56 @@ class ProxyServer:
                 continue
             except OSError:
                 break
+            with self._active_lock:
+                full = self.max_clients > 0 and self._active >= self.max_clients
+                if not full:
+                    self._active += 1
+            if full:
+                self._refuse_full(conn)
+                continue
             threading.Thread(
-                target=self._handle_client, args=(conn, addr), daemon=True
+                target=self._serve_counted, args=(conn, addr), daemon=True
             ).start()
+
+    def _serve_counted(self, conn: socket.socket, addr) -> None:
+        try:
+            self._handle_client(conn, addr)
+        finally:
+            with self._active_lock:
+                self._active -= 1
+
+    def _refuse_full(self, conn: socket.socket) -> None:
+        """Turn a connection away at the cap, on the accept thread, quickly.
+
+        ``retry: true`` because a full server is not a wrong code: the client
+        should keep trying (S22's clients stop on any other ``auth_fail``).
+        """
+        try:
+            conn.settimeout(1.0)
+            conn.sendall(encode_message({
+                "type": "auth_fail", "retry": True,
+                "reason": f"server full ({self.max_clients} connections)",
+            }))
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def _handle_client(self, conn: socket.socket, addr) -> None:
         client = _Client(conn, addr)
         try:
             conn.settimeout(_AUTH_TIMEOUT)
+            remaining = self.limiter.banned_for(self._address(client))
+            if remaining:
+                self._send_now(client, {
+                    "type": "auth_fail",
+                    "reason": f"too many failed attempts; try again in "
+                              f"{int(remaining + 0.999)}s",
+                })
+                return
             if not self._authenticate(client):
                 return
             conn.settimeout(None)
@@ -198,6 +320,23 @@ class ProxyServer:
             client.shutdown()
             logger.info("Client %s disconnected", addr)
 
+    @staticmethod
+    def _address(client: _Client) -> str:
+        addr = client.addr
+        return str(addr[0]) if isinstance(addr, tuple) and addr else str(addr)
+
+    def _reject(self, client: _Client, reason: str) -> bool:
+        """Refuse this attempt, and count it against the client's address."""
+        self._send_now(client, {"type": "auth_fail", "reason": reason})
+        address = self._address(client)
+        if self.limiter.record_failure(address):
+            minutes = self.limiter.ban / 60
+            self.session.publish_notice(
+                f"proxy: refusing {address} for {minutes:g} min after "
+                f"{self.limiter.max_failures} failed auth attempts"
+            )
+        return False
+
     def _authenticate(self, client: _Client) -> bool:
         for line in client.read_lines():
             if not line.strip():
@@ -205,16 +344,14 @@ class ProxyServer:
             try:
                 msg = decode_message(line)
             except ValueError:
-                self._send_now(client, {"type": "auth_fail", "reason": "bad message"})
-                return False
+                return self._reject(client, "bad message")
             if msg.get("type") != "auth":
-                self._send_now(client, {"type": "auth_fail", "reason": "expected auth"})
-                return False
+                return self._reject(client, "expected auth")
             code = str(msg.get("code", ""))
             role = self.auth.get(code)
             if role is None:
-                self._send_now(client, {"type": "auth_fail", "reason": "invalid code"})
-                return False
+                return self._reject(client, "invalid code")
+            self.limiter.record_success(self._address(client))
             client.role = role
             self._send_now(
                 client,
@@ -300,20 +437,35 @@ class ProxyServer:
             data = str(msg["text"]).encode("utf-8", errors="replace") + eol
         else:
             return
+        # The TX line event fires synchronously inside write(), on this thread.
+        self._origin.client = client
         try:
             self.session.write(data)
         except Exception as exc:  # noqa: BLE001
             client.enqueue(encode_message({"type": "notice", "text": f"write failed: {exc}"}))
+        finally:
+            self._origin.client = None
 
     # ── server → client (bus fan-out) ─────────────────────────────────────────
 
     def _on_event(self, event: Event) -> None:
         msg = self._serialize(event)
+        skip = None
+        if msg is None and self.echo_tx and event.kind == EventKind.LINE \
+                and event.direction == Direction.TX:
+            msg = {
+                "type": "tx_echo",
+                "seq": event.seq,
+                "wall": event.stamp.wall_str(),
+                "elapsed": round(event.stamp.elapsed, 4),
+                "text": event.text,
+            }
+            skip = getattr(self._origin, "client", None)
         if msg is None:
             return
         line = encode_message(msg)
         with self._clients_lock:
-            clients = list(self._clients)
+            clients = [c for c in self._clients if c is not skip]
         for client in clients:
             if not client.enqueue(line):
                 # Backlog full: the client can't keep up — drop it.

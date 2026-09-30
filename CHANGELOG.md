@@ -1,5 +1,96 @@
 # Changelog
 
+## [1.20260930.1193756] — 2026-09-30
+
+The proxy became safe to leave on a network, and the TUI learned to find
+things — a port, a line, a code that scrolled away.
+
+### Changed
+- **BREAKING: `--serve` without `--auth` no longer uses `123456`** (SPEC S22).
+  It generates a random code for the run — full access, printed at startup —
+  because `--serve` listens on every interface and a well-known code there is
+  an open door. Pass `--auth 123456` to keep the old behaviour explicitly; any
+  code you give is used as given.
+- `--serve` on every interface now says so at startup, with the flag that keeps
+  it on this machine (`--listen 127.0.0.1`).
+
+### Added
+- **Say who has the port when it is busy** (SPEC S21). Opening a port that
+  another process holds used to report `[Errno 16] Resource busy` once a second
+  and nothing else. Now the first busy attempt of a streak raises one NOTICE
+  naming the holder and the way in:
+  - a **background session of ours** — the likeliest case since `start` —
+    is named from its state file, with `uart-proxy attach <name>`, its mirror
+    directory if it has one, and `uart-proxy stop <name>`;
+  - anything else is named from `lsof` (`screen (pid 777)`) where `lsof` exists
+    and can see it, with the ways to share the port on purpose (`--proxy-dir`,
+    `--serve` + `remote`);
+  - `/dev/cu.X` and `/dev/tty.X` count as one port, since holding either makes
+    the other `EBUSY`. On Windows, "Access is denied" on a COM port is read as
+    busy — a COM port has no permission bits to deny.
+- **`start` refuses a port a background session already holds**, naming it and
+  pointing at `attach` / `stop`. A second daemon there could only wait forever
+  — or, if the first had opted out with `--no-exclusive`, split the stream.
+- **Guessing the proxy code is rate-limited** (SPEC S22): 10 failed attempts
+  from one address within a minute and that address is refused for 10 minutes,
+  even with the right code, with a notice in the session. Per address and
+  expiring on its own, so a stranger cannot use it to lock everyone out, and a
+  right code clears earlier typos.
+
+- **The auth code can be found again** after the console scrolls (SPEC S23):
+  - `Ctrl+] i` in the TUI shows proxy address, codes and roles, the `attach`
+    name, mirrors and log folder — as a toast only, never in the log or sent to
+    proxy clients; the status bar shows `serve <addr>` without the code.
+  - `connect --serve` is now registered like a background session, marked
+    `(foreground)`: `status --show-auth` prints its codes, `attach` joins it
+    from another terminal, and it is unregistered on exit. `status` hides codes
+    unless asked.
+  - `attach` reaches a session bound to `0.0.0.0` via `127.0.0.1`.
+
+- **Fixed proxy codes in `~/.uart-proxy/config.toml`** (SPEC S24):
+  `[proxy] auth = ["code", "code:readonly"]`, used by `connect --serve` and
+  `start` when `--auth` is absent. Ignored with a note — falling back to a
+  generated code — if the file is readable by others, the value is malformed,
+  or Python is 3.10 (no `tomllib`).
+- **A refused proxy client stops instead of retrying** (SPEC S22). `remote` and
+  `attach` used to reconnect with a wrong code about once a second — and with
+  the new rate limit, ban their own address within seconds. The realistic
+  trigger: restart a `connect --serve`, get a fresh generated code, and every
+  client still holding the old one reconnects with it. An unreachable server is
+  still retried.
+
+- **Choose the port from a list** (SPEC S27): `connect` without `--port`, in a
+  terminal. Without one it lists the ports and exits rather than wait.
+- **`--profile NAME|FILE.toml`** (SPEC S30) for `connect` and `start`: a
+  `uart_helper` profile's `[defaults]` fill in the serial settings no flag
+  gives, and its `[[rules]]` find the port when `--port` is left out.
+- **Search the log** (SPEC S28): `Ctrl+] /` shows only the lines that match,
+  highlighted and live, until an empty search; `Ctrl+W` copies what is shown.
+- **Log banners** (SPEC S25): the timestamped logs open with version, port,
+  settings and the wall-clock time of elapsed 0, and close with the window in
+  both axes. `output.log` is untouched.
+- **`--echo-tx`** (SPEC S29): proxy clients see each line typed into the
+  device, by anyone but themselves. Off by default — passwords are lines too.
+- **`--max-clients N`** (SPEC S26, default 16): connections beyond it are told
+  the server is full and keep retrying.
+- **Mirrors in the status bar**: `mirrors N`, and `dropped …` in red once a
+  reader falls behind.
+
+### Fixed
+- **Typed lines never completed with the default `--eol cr`**, so they were
+  missing as `>` lines from the log view and from `--log-tx` recordings: the
+  line assembler only ended a line on `\n`. What is typed now ends a line on
+  `\r`, `\n` or `\r\n`; device output keeps treating a bare `\r` as a repaint.
+- **`connect --no-tui --no-reconnect` never exited when the port would not
+  open.** The session gave up after one attempt but said nothing, and headless
+  mode waits for `disconnected`. Giving up is now announced, once.
+- **Waiting for a device printed a `waiting` line every second** — 3,600 an
+  hour in the log view and on stderr. It is now said once, and again only when
+  the reason changes (absent → busy, say).
+- **`start --listen-port 0` reported `proxy 127.0.0.1:0`.** The banner is
+  printed by the launching process, which read the port it had asked for; it
+  now reads back the one the daemon actually bound.
+
 ## [1.20260929.1214712] — 2026-09-29
 
 Character mode became a terminal, not just a keyboard.

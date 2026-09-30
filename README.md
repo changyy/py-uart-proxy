@@ -50,7 +50,7 @@ Beyond the original seven:
 
 ## Install
 
-Once published to PyPI:
+From PyPI:
 
 ```bash
 pipx install uart-proxy
@@ -72,6 +72,39 @@ Verify:
 uart-proxy --version
 uart-proxy ports
 ```
+
+### Trying a working copy as the real command
+
+The venv above only puts `uart-proxy` on your `PATH` while it is activated. To
+try your checkout the way users will run it — from any terminal, including
+`start` / `attach` across shells — install it with pipx straight from the
+directory:
+
+```bash
+pipx install --force ~/py-uart-proxy     # replaces any PyPI install of uart-proxy
+uart-proxy --version                     # should print the version in _version.py
+```
+
+This is a *copy*, not a link: run it again after each change you want to try.
+(`pipx install --force --editable ~/py-uart-proxy` links instead, so edits take
+effect immediately.) To go back to the published release:
+`pipx install --force uart-proxy`.
+
+Stop any background sessions (`uart-proxy stop --all`) before reinstalling,
+so a daemon still running the old code doesn't keep hold of the port.
+
+### Running the tests
+
+```bash
+python -m pytest -q                      # inside the venv above; no hardware needed —
+                                         # the suite never opens a real port (conftest.py)
+python examples/check_pty_mirrors.py     # PTY mirrors against a fake device (POSIX)
+python examples/check_char_mode.py       # character mode against a real bash (POSIX)
+```
+
+A few behaviours can only be confirmed with a real adapter, because the pty
+driver ignores `TIOCEXCL` — see the manual checks in [SPEC.md](./SPEC.md)
+(S15, S21).
 
 ---
 
@@ -157,6 +190,8 @@ which no longer quits — so exactly **one** key is reserved as a command prefix
 | `Ctrl+] q` | quit |
 | `Ctrl+] c` | switch character ⇄ line mode |
 | `Ctrl+] t` `y` `k` `w` `e` | timestamps · hex · clear · copy · select mode |
+| `Ctrl+] /` | **search** — show only the log lines containing a pattern (smart case), live; an empty search brings the full log back. Line mode only |
+| `Ctrl+] i` | session info — proxy address, **auth code(s)**, `attach` name, mirrors, logs (a toast only: never written to the log or sent to proxy clients) |
 | | (`k` in character mode clears the **screen**; the log behind it is kept) |
 | `Ctrl+] Ctrl+]` | send a literal `Ctrl+]` to the device |
 
@@ -213,6 +248,43 @@ tune the retry period with `--reconnect-interval SECONDS`.
 `--baud` defaults to **115200**, so it is optional. The effective baud (and
 framing) is always visible in the status bar, e.g. `… @ 115200 8N1`.
 
+### Choosing the port
+
+Leave out `--port` in a terminal and `connect` shows the ports to pick from
+(`r` rescans after you plug something in, `Esc` cancels); a port one of your
+sessions already holds is marked, with a pointer to `attach`. Without a
+terminal — a script, a pipe, `--no-tui` — it lists them and exits instead of
+waiting for a keypress. `start` never asks: give it `--port`, or a profile.
+
+### Device profiles (`--profile`)
+
+`uart_helper` profiles work here too — TOML files in `./uart-helper.d/` or
+`~/.config/uart-helper/`:
+
+```toml
+# ~/.config/uart-helper/lab.toml
+[defaults]
+baudrate = 9600
+parity = "E"
+rtscts = true
+
+[[rules]]
+vid = "067b"
+pid = "23a3"
+```
+
+```bash
+uart-proxy connect --profile lab          # finds the matching port, 9600 8E1
+uart-proxy connect --profile lab --baud 115200   # a flag still wins
+uart-proxy start --profile lab            # background, same rules
+```
+
+`[defaults]` fills in baud / bytesize / parity / stopbits / flow control
+wherever no flag is given; `[[rules]]` pick the port when `--port` is left out
+— one match is used, several are offered to choose from (or listed, where
+nobody can choose), none is an error. `--profile` also takes a path to a
+`.toml` file.
+
 ### Line ending on Enter (`--eol`)
 
 Pressing Enter appends a line ending, default **`cr`** (`\r`) — the convention
@@ -251,6 +323,18 @@ clobbered:
 ~/.uart-proxy/sessions/<YYYYmmdd-HHMMSS>/output*.log
 ```
 
+The two timestamped files open with a `#` banner and close with the window,
+so a log read months later still says what it is:
+
+```
+# uart-proxy 1.20260930.… · /dev/tty.usbserial-110 @ 115200 8N1
+# encoding utf-8 · eol cr · started 2026-09-30 11:33:26 +08:00 (elapsed 0 = this instant)
+[00:00:01.2034] U-Boot 2024.01 …
+# ended · 2026-09-30 11:33:26 ~ 2026-09-30 12:10:02 (2196s) · 00:00:00.0000 ~ 00:36:36.0412
+```
+
+`output.log` gets no banner: it stays exactly the bytes the device sent.
+
 The path is printed at startup and shown live in the TUI status bar
 (`rec→…`). Override with `--output-dir DIR` (use `--output-dir .` for the
 current directory), rename the files with `--log-base NAME`, disable with
@@ -287,6 +371,18 @@ max_total_mb = 500     # 0 = no size cap
 
 Precedence: CLI flag > config file > built-in default.
 
+The same file can hold **fixed proxy codes**, so a restart doesn't mean sending
+everyone a new one — and the code stays off the command line, where `ps` would
+show it to other users:
+
+```toml
+[proxy]
+auth = ["fixedcode", "look:readonly"]
+```
+
+It is ignored (with a note, falling back to a generated code) unless the file
+is private — `chmod 600 ~/.uart-proxy/config.toml` — and needs Python 3.11+.
+
 ### 4. BBS / telnet style ASCII
 
 ```bash
@@ -308,6 +404,33 @@ From another machine:
 ```bash
 uart-proxy remote --host 192.168.1.10 --port 9600 --auth 123456
 ```
+
+Leave out `--auth` and a random code is generated for this run and printed —
+there is no fixed default, because `--serve` listens on **every interface**
+unless you pass `--listen 127.0.0.1`, and says so when it starts:
+
+```
+No --auth given; generated code 71baffb7cbe50ef7 (full access).
+Proxy listening on 0.0.0.0:9600
+  (every interface — reachable from the network; --listen 127.0.0.1 keeps it on this machine)
+```
+
+Two more knobs for sharing:
+
+- `--echo-tx` shows every client each **line** typed into the device, by anyone
+  (not keystroke by keystroke, and not back to whoever typed it). Off by
+  default, because a password typed at a login prompt is a line too.
+- `--max-clients N` (default 16) caps connections served at once; the next one
+  is told the server is full and keeps retrying. `0` removes the cap.
+
+A client refused by the server — wrong code, or refused for guessing — stops
+rather than retrying, so a server restarted with a new code can't get its old
+clients banned. Guessing is rate-limited per address: **10 failed attempts within a minute** and
+that address is refused for **10 minutes** (with a notice in the session), even
+with the right code. Other addresses are unaffected, and it clears on its own —
+no restart needed. The code travels in plain text, so on a network you don't
+trust, tunnel it (e.g. `ssh -L 9600:127.0.0.1:9600 host`) and listen on
+loopback.
 
 #### Attaching to a `uart_helper`-owned port (integration apps)
 
@@ -392,6 +515,21 @@ A read-only client (`--auth 000000`) can watch the stream but cannot send.
 >
 > Note pyserial's own `exclusive=True` is *not* this: it takes an advisory
 > `flock`, which only stops other programs that also `flock`.
+>
+> The other way round — **you** are the one refused — `connect` says who has the
+> port and how to get at it instead of just `Resource busy`. The likeliest holder
+> is a background session you forgot about, and then the way in is one command:
+>
+> ```
+> * port busy: /dev/tty.usbserial-110 is held by background session
+>   'usbserial-110' (pid 50073) — join it with 'uart-proxy attach usbserial-110',
+>   or open one of its mirrors in /tmp/uart-proxy; free it with
+>   'uart-proxy stop usbserial-110'
+> ```
+>
+> Any other holder is named from `lsof` (`screen (pid 777)`) where it can see it.
+> `start` goes further and refuses outright to launch a second background
+> session on a port one already holds.
 
 ### 6. Share the port with local tools (PTY mirrors)
 
@@ -508,8 +646,8 @@ to know about a session you left running.
 While it runs you can reach it two ways, and both work at the same time:
 
 ```bash
-uart-proxy remote --host 127.0.0.1 --auth "$(python3 -c \
-  'import json;print(json.load(open("'"$HOME"'/.uart-proxy/daemons/router.json"))["auth"])')"
+uart-proxy attach router               # no code needed — see below
+uart-proxy status --show-auth          # or look the code up, for `remote` elsewhere
 screen /tmp/uart-proxy/router-1        # or just attach to a mirror
 ```
 
@@ -519,9 +657,14 @@ screen /tmp/uart-proxy/router-1        # or just attach to a mirror
 - `--name` names the **session and its mirrors** (`router-0`, `router-1`), so one
   word is the handle for the whole thing. Without it, both default to the device
   stem.
-- `connect` is unchanged: foreground, single process, no daemon. Detaching is
+- `connect` stays foreground, single process, no daemon. Detaching is
   explicit, because a leftover daemon holding the port (it claims it exclusively —
   see above) is a confusing thing to inflict on the simple case.
+- `connect --serve` **is registered too**, marked `(foreground)` in `status`, so
+  its code — generated, and long gone off the top of the terminal — can be looked
+  up with `status --show-auth`, and `attach` works on it from another terminal.
+  It is unregistered when it exits. (`status` hides codes unless asked: its
+  output gets pasted around.)
 - `start` **fails if the daemon fails** — it waits for the child to report that
   it's serving. An *absent device* isn't a failure, though: waiting for it to be
   plugged in is normal.
@@ -604,6 +747,7 @@ py-uart-proxy/
     core/    timestamp · events · bus · line_assembler · recorder · session
              retention · pty_proxy (local PTY mirrors) · daemon (background
              sessions: state files, detach, liveness) · replay (history for attach)
+             port_busy (who holds a busy port, and the way in instead)
     io/      source (ABC) · uart_source · socket_source
     proxy/   protocol (JSON-lines + auth/roles) · server
     plugins/ base · manager · builtin/grep

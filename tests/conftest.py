@@ -9,6 +9,27 @@ import pytest
 from uart_proxy.io.source import DataSource
 
 
+@pytest.fixture(autouse=True)
+def no_real_hardware(request, monkeypatch):
+    """In-process tests never see this machine's serial ports or detach a daemon.
+
+    A test that scans for a port and finds a real one goes on to open it — and
+    a developer's plugged-in adapter matching a test profile once did exactly
+    that, detaching a daemon onto it. Tests that need either say so with
+    ``@pytest.mark.real_ports`` / ``@pytest.mark.real_daemonize``; subprocess
+    tests are unaffected and use ptys.
+    """
+    from uart_proxy import cli
+
+    if "real_ports" not in request.keywords:
+        monkeypatch.setattr(cli, "_scan_ports", lambda: [])
+    if "real_daemonize" not in request.keywords:
+        def refuse(**kwargs):
+            raise AssertionError("an in-process test tried to detach a daemon")
+
+        monkeypatch.setattr(cli, "daemonize", refuse)
+
+
 class FakeSource(DataSource):
     """
     An in-memory DataSource for tests.

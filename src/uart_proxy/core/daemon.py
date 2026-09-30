@@ -86,6 +86,12 @@ class DaemonInfo:
     mirrors: list[str] = field(default_factory=list)
     started_at: float = 0.0      # epoch seconds
     version: str = ""
+    #: Every code the proxy accepts, with its role. ``auth`` is the one
+    #: ``attach`` uses; this is what ``status --show-auth`` lists.
+    codes: dict[str, str] = field(default_factory=dict)
+    #: A ``connect --serve`` in a terminal rather than a detached ``start``
+    #: (SPEC S23): registered so ``status`` / ``attach`` can find it too.
+    foreground: bool = False
 
     # ── persistence ────────────────────────────────────────────────────────
 
@@ -207,6 +213,29 @@ def prune_dead() -> list[DaemonInfo]:
 
 class DaemonNotFound(Exception):
     """No daemon matched — carries a message worth showing the user verbatim."""
+
+
+def unique_name(base: str) -> str:
+    """``base``, or ``base-2``, ``base-3``… — the first no live session uses."""
+    taken = {d.name for d in list_daemons()}
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = f"{base}-{n}"
+    return name
+
+
+def connect_host(listen_host: str) -> str:
+    """Where a local client should connect to reach a server bound here.
+
+    A wildcard bind is reachable on loopback, and connecting *to* ``0.0.0.0``
+    is not portable, so translate it.
+    """
+    if listen_host in ("", "0.0.0.0"):
+        return "127.0.0.1"
+    if listen_host == "::":
+        return "::1"
+    return listen_host
 
 
 def find_daemon(name: Optional[str] = None) -> DaemonInfo:

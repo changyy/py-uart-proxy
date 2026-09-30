@@ -13,11 +13,20 @@ from __future__ import annotations
 
 
 class LineAssembler:
-    def __init__(self) -> None:
+    def __init__(self, *, cr_ends_line: bool = False) -> None:
+        """``cr_ends_line`` for what a person types: Enter on a serial console
+        is a bare ``\r`` (``--eol cr``, and every keystroke in character mode),
+        which would otherwise never finish a line. Device output keeps the
+        default, where a bare ``\r`` is a repaint, not a line end.
+        """
         self._buf = bytearray()
+        self._cr_ends_line = cr_ends_line
+        self._after_cr = False   # swallow the \n of a \r\n split across feeds
 
     def feed(self, data: bytes) -> list[bytes]:
         """Append ``data`` and return any complete lines (without terminators)."""
+        if self._cr_ends_line:
+            return self._feed_cr(data)
         self._buf.extend(data)
         lines: list[bytes] = []
         while True:
@@ -27,6 +36,20 @@ class LineAssembler:
             raw = bytes(self._buf[:idx]).rstrip(b"\r")
             del self._buf[: idx + 1]
             lines.append(raw)
+        return lines
+
+    def _feed_cr(self, data: bytes) -> list[bytes]:
+        lines: list[bytes] = []
+        for byte in data:
+            if byte == 0x0A and self._after_cr:   # the \n of \r\n
+                self._after_cr = False
+                continue
+            self._after_cr = byte == 0x0D
+            if byte in (0x0D, 0x0A):
+                lines.append(bytes(self._buf))
+                self._buf.clear()
+            else:
+                self._buf.append(byte)
         return lines
 
     @property
@@ -39,4 +62,5 @@ class LineAssembler:
             return None
         raw = bytes(self._buf).rstrip(b"\r")
         self._buf.clear()
+        self._after_cr = False
         return raw

@@ -26,11 +26,15 @@ import time
 
 from ..core.replay import ReplayEntry
 from ..proxy.protocol import Role, decode_message, encode_message
-from .source import DataSource
+from .source import DataSource, SourceRefused
 
 
 class SocketSourceError(Exception):
     """Raised when the remote connection cannot be established or authed."""
+
+
+class AuthRefused(SocketSourceError, SourceRefused):
+    """The server rejected our code (or our address). Not worth retrying."""
 
 
 class SocketSource(DataSource):
@@ -63,6 +67,8 @@ class SocketSource(DataSource):
         #: The server's own elapsed time at the moment we authenticated, so the
         #: client can share its timeline rather than starting a second one.
         self.remote_elapsed: float | None = None
+        #: Called with each `tx_echo` line, if the server sends them (S29).
+        self.on_tx_echo = None
 
     def open(self) -> None:
         # Idempotent: `attach` connects up front so the replayed history is in
@@ -89,7 +95,9 @@ class SocketSource(DataSource):
         if msg.get("type") != "auth_ok":
             reason = msg.get("reason", "authentication failed")
             self.close()
-            raise SocketSourceError(str(reason))
+            if msg.get("retry"):
+                raise SocketSourceError(str(reason))  # e.g. full: try again
+            raise AuthRefused(str(reason))
 
         role_str = msg.get("role", Role.FULL.value)
         try:
@@ -180,6 +188,11 @@ class SocketSource(DataSource):
             self._handle_live(msg)
 
     def _handle_live(self, msg: dict) -> None:
+        if msg.get("type") == "tx_echo":
+            # A line someone else typed into the device (SPEC S29).
+            if self.on_tx_echo is not None and isinstance(msg.get("text"), str):
+                self.on_tx_echo(msg["text"])
+            return
         if msg.get("type") == "rx":
             hex_str = msg.get("hex", "")
             if hex_str:

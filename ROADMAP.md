@@ -17,7 +17,7 @@ The seven original requirements, implemented end to end.
 - ✅ **Mouse follow-tail**: wheel-up pauses auto-scroll to read history, wheel
   back to bottom (or `End`) resumes; status shows follow/paused (SPEC S10).
 - ✅ Tests: engine unit tests, end-to-end proxy over a real socket, and TUI
-  tests via Textual's headless harness (29 tests).
+  tests via Textual's headless harness (29 tests at v0.1; 393 today).
 - 🟡 Manual hardware validation on macOS + Windows 11.
 
 ## v0.2 — Robustness & UX
@@ -72,7 +72,8 @@ The seven original requirements, implemented end to end.
   `--prefix` reconfigures. Verified by spike that Textual delivers `ctrl+c` to
   `on_key` and that the app survives it; character mode also stands the app's own
   priority bindings down (`check_action`) so `Ctrl+W` reaches the shell.
-  - 💡 Surface mirror count / dropped bytes in the TUI status bar.
+  - ✅ Mirror count and dropped bytes in the TUI status bar (`mirrors 2`,
+    `dropped 2.0 KB` in red once a reader falls behind).
 - ✅ **The terminal view** (SPEC S20): character mode now renders device output
   through a real terminal emulator (`pyte`), so Tab completion, backspace, `\r`
   repaints, ANSI colour, `clear`, `vi` and `htop` all behave. S19 had fixed only
@@ -86,20 +87,24 @@ The seven original requirements, implemented end to end.
     independent of the input mode) — the emulator already tracks either way.
   - 💡 Tell the device the window size where the transport can carry it: a
     remote proxy client could send one, even though RS-232 cannot.
-- ⬜ **Port-busy hint**: when opening a port fails because another process holds
-  it (UART is exclusive-open — and now doubly so, since we claim it ourselves),
-  detect this and suggest attaching via `uart-proxy remote` or a PTY mirror
-  instead.
+- ✅ **Port-busy hint** (SPEC S21): when opening the port fails because another
+  process holds it, `connect` raises one NOTICE per busy streak naming the holder
+  — a background session of ours from its state file (`attach` / its mirrors /
+  `stop`), anything else from `lsof` — instead of a bare `Resource busy`.
+  `start` refuses a second background session on a port one already holds.
 - ⬜ **Telnet IAC handling**: minimal negotiation so real telnet/BBS sessions
   render cleanly (currently raw passthrough).
-- ⬜ **TUI port picker**: when `--port` is omitted, show a selectable list.
-- ⬜ **Scrollback search / filter** in the TUI (find, highlight, freeze).
-- ⬜ **Session header line** in logs (start time, port, baud, the absolute &
-  relative window banner).
-- ⬜ **TX echo over proxy**: optionally forward operator TX to all clients so
-  remote viewers see what was typed.
-- ⬜ **Config profiles**: reuse `uart_helper` TOML profiles for `connect`
-  (baud/parity/device defaults by name).
+- ✅ **TUI port picker** (SPEC S27): `connect` without `--port` lists the ports
+  in a terminal, and lists-and-exits where nobody can answer.
+- ✅ **Scrollback search / filter** (SPEC S28): `Ctrl+] /` shows only matching
+  lines, highlighted, live; `Ctrl+W` copies what is shown.
+- ✅ **Session header line** in logs (SPEC S25): a `#` banner and closing window
+  in the timestamped files; the raw log stays pure.
+- ✅ **TX echo over proxy** (SPEC S29): `--echo-tx` forwards typed lines to the
+  other clients. Found on the way: with the default `--eol cr` no typed line
+  ever completed, so TX lines were missing from the log view and `--log-tx`.
+- ✅ **Config profiles** (SPEC S30): `--profile NAME|FILE` reuses `uart_helper`
+  profiles — settings where no flag is given, and rules to find the port.
 
 ## v0.3 — Security & packaging
 
@@ -107,7 +112,13 @@ The seven original requirements, implemented end to end.
   today; fine on a trusted LAN, not the open internet.
 - ⬜ **Per-role command allow-list** (e.g. a role that may only send specific
   commands).
-- ⬜ **Rate limit / connection cap** on the proxy.
+- ✅ **Auth rate limit** (SPEC S22): 10 failed attempts from one address within
+  a minute refuse that address for 10 minutes — per address and time-limited,
+  so it cannot be used to lock everyone out.
+- ✅ **Find the auth code again** (SPEC S23): `Ctrl+] i` in the TUI, and
+  `connect --serve` registered so `status --show-auth` / `attach` work on it.
+- ✅ **Connection cap** (SPEC S26): `--max-clients` (16); the next client is
+  told to retry, and a refused client (wrong code) stops instead of retrying.
 - 🟡 **PyPI / pipx** as the primary channel — `uart-helper` is now a real
   dependency so `pipx install uart-proxy` will work once published.
 - ✅ **Standalone repo** — the PC app now lives in its own
@@ -167,7 +178,13 @@ Not changing the library here — collecting suggestions for its maintainers:
 
 ## Open questions
 
-- ⬜ Default proxy bind: keep `0.0.0.0` or default to `127.0.0.1` and require
-  opt-in for LAN exposure? (Security vs convenience.)
-- ⬜ Should remote clients see and replay the wall-clock timestamps from the
-  *server*, or re-stamp locally on arrival? (Currently re-stamped locally.)
+- ✅ Default proxy bind: keep `0.0.0.0` or default to `127.0.0.1` and require
+  opt-in for LAN exposure? Settled by SPEC S22: keep `0.0.0.0` (serving is for
+  other machines) and make the *code* strong instead — no `--auth` now means a
+  random one, not `123456` — plus a per-address rate limit, and a startup line
+  saying it is reachable from the network.
+- ✅ Should remote clients see and replay the wall-clock timestamps from the
+  *server*, or re-stamp locally on arrival? Settled by `attach` + replay (SPEC
+  S18): replayed history keeps the server's stamps, and the client **adopts the
+  server's elapsed origin** (`auth_ok.elapsed`) for live lines, since a local
+  origin makes the elapsed column jump backwards where the history ends.

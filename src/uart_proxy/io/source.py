@@ -12,6 +12,16 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 
+class SourceRefused(Exception):
+    """The far end said no, and asking again will not change its answer.
+
+    Raised from ``open()`` for a refusal rather than an absence — a wrong auth
+    code, a ban. The session stops instead of retrying: a retry would repeat the
+    same wrong code every ``reconnect_interval``, and against a rate-limited
+    proxy (SPEC S22) that gets the client's own address refused.
+    """
+
+
 class DataSource(ABC):
     """A bidirectional byte transport."""
 

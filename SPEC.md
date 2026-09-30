@@ -41,6 +41,12 @@ Requirement IDs (`R1`–`R7`) match the original feature list.
 **Acceptance**
 - `feed(b"a\r\nb")` yields `[b"a"]` and leaves `b"b"` pending; `flush()` → `b"b"`.
 
+**TX** (what is typed) uses `cr_ends_line`: a bare `\r`, a `\n`, or a `\r\n` —
+even split across two writes — each end exactly one line. Enter on a serial
+console is a bare `\r` (`--eol cr`, the default, and every keystroke in
+character mode); ending TX lines only on `\n` meant no typed line ever
+completed. **RX** keeps `\n` only: a device's bare `\r` is a repaint.
+
 ## S4. Recording (R2)
 
 - With recording on, exactly these files are produced from RX traffic:
@@ -83,11 +89,17 @@ Requirement IDs (`R1`–`R7`) match the original feature list.
 - `start()` does not block: it returns immediately and a background manager
   opens the source.
 - If the source can't be opened (device absent / no permission), the session
-  enters a `waiting` state and retries every `reconnect_interval` seconds,
-  emitting a STATUS event; it attaches as soon as the device appears.
+  enters a `waiting` state and retries every `reconnect_interval` seconds; it
+  attaches as soon as the device appears. The `waiting` STATUS is emitted on
+  the first failed attempt and again only when the error **changes** (absent →
+  busy, say) — a wait can last hours, and one line per retry would bury
+  everything else. A successful open ends the wait, so the next one is
+  reported afresh.
 - If the source drops mid-session (read error), it emits `reconnecting`, closes,
   and re-attaches when the device returns.
-- `auto_reconnect=False` disables retries (one attempt, then give up).
+- `auto_reconnect=False` disables retries (one attempt, then give up). Giving
+  up is announced with `disconnected` (`reason: gave up`), exactly once even if
+  `stop()` follows — headless mode ends on it, and without it waited forever.
 - `write()` while not connected raises (it cannot reach the device).
 - Default baud is 115200 (CLI `--baud` optional); the effective baud is shown in
   the status bar via the source description.
@@ -95,7 +107,12 @@ Requirement IDs (`R1`–`R7`) match the original feature list.
 **Acceptance**
 - A source whose first N `open()`s fail eventually connects and streams data.
 - A connected session that hits a read error re-connects and resumes streaming.
-- With `auto_reconnect=False`, a failing open never connects.
+- With `auto_reconnect=False`, a failing open never connects, and one
+  `disconnected` is emitted; `connect --no-tui --no-reconnect` on an absent
+  device exits.
+- Ten failed opens with the same error produce one `waiting`; errors
+  absent, absent, busy, busy, absent produce three; a drop and a new wait
+  produce a second.
 - `write()` on a disconnected session raises `RuntimeError`.
 
 ## S13. Copying log text (TUI)
@@ -670,3 +687,304 @@ Two details that are easy to get wrong, both pinned by test:
   a filename in place, the typed command occupies one row rather than one per
   character, `^C` abandons the line, colour survives, and ↑ recalls from the
   shell's own history.
+
+## S21. When the port is busy, say who has it
+
+A serial port is exclusive-open, and ours doubly so (S15). Since background
+sessions (S17) the likeliest holder of a busy port is **our own daemon**, started
+and forgotten — and all the session reported was `waiting` with
+`[Errno 16] Resource busy`, once per `--reconnect-interval`. True, and no help:
+the fix is almost always one command away.
+
+- **Recognising busy.** `UartSource.open()` sets `busy` when the open failed
+  because another process holds the port. `uart_helper` re-raises pyserial's
+  error as a `UARTError`, so `is_busy_error` walks the cause chain for
+  `errno == EBUSY` (or its text). On Windows a COM port held elsewhere fails
+  with "Access is denied", which `uart_helper` files as a permission error; a COM
+  port has no permission bits, so there it counts as busy. An absent device or a
+  real permission problem is not busy.
+- **Naming the holder**, best-effort, in this order:
+  1. a **registered background session** — its pid among `lsof`'s holders, or,
+     when `lsof` is missing or cannot see the pid, a live state file whose
+     `port` is this device. The hint gives `uart-proxy attach <name>`, its
+     `proxy_dir` if it has mirrors, and `uart-proxy stop <name>`;
+  2. any other process `lsof` reports (`screen (pid 777)`), with the ways to
+     share on purpose: `--proxy-dir`, or `--serve` and `uart-proxy remote`;
+  3. nobody known — the same alternatives, without a name.
+- **`cu.X` and `tty.X` are one port** for all of this: holding either makes the
+  other `EBUSY` (S15's table), so both nodes are asked about and matched.
+- **Once per streak.** The NOTICE is raised on the first busy `waiting` after
+  start or after a successful open, not on every retry — `lsof` walks every open
+  file on the machine, and the answer does not change each second. `lsof` is
+  given 2 s; a late hint is worth less than none.
+- **`start` refuses a held port** before detaching, naming the session that has
+  it. A second daemon there could only wait forever, or — if the first had
+  taken `--no-exclusive` — split the stream with it.
+
+**Acceptance**
+- `EBUSY` is recognised wrapped in `UARTError`, and bare; `ENOENT` and a POSIX
+  permission error are not; "Access is denied" is, on Windows.
+- `paired_nodes` / `same_device` treat `/dev/cu.X` and `/dev/tty.X` as one port
+  and leave other paths alone.
+- A holder whose pid is a registered session gets `attach` / mirrors / `stop`;
+  with no `lsof` result the registry still answers; a session on *another* port
+  is never blamed; an unknown holder still gets the alternatives.
+- `find_holders` names a real process holding a pty open, never ourselves, and
+  returns `[]` without `lsof` or for a missing node.
+- Five busy `waiting` events produce one NOTICE and one lookup; `connected` ends
+  the streak; waiting for an absent device raises none.
+- `start` on a port a live state file holds exits 1 naming it.
+- **By hand**, since the pty driver ignores `TIOCEXCL`: on macOS 15 with
+  `/dev/tty.Bluetooth-Incoming-Port` held under `TIOCEXCL` by a pyserial script,
+  `connect` named `Python (pid …)`; with it held by `start --name bt`, a
+  second `start` was refused and `connect` pointed at `uart-proxy attach bt` and
+  the mirror directory.
+
+## S22. No guessable default code; guessing is rate-limited
+
+`--serve` without `--auth` used to install a fixed `123456` with full access,
+and `--serve` binds every interface by default — a well-known password on the
+LAN. Binding loopback by default was considered and rejected: the point of
+`--serve` is to let *other* machines in, so that default would be switched off
+every time it was used. The code is what has to be strong.
+
+- **No `--auth` → a random code**, `secrets.token_hex(8)` (the same generator
+  `start` uses), fresh each run, full access, printed at startup. Any `--auth`
+  given is used exactly as given, and nothing is generated.
+- **Listening on every interface is said out loud** at startup, with the flag
+  that keeps it local.
+- **Failed attempts are counted per address**: `MAX_AUTH_FAILURES` (10) within
+  `FAIL_WINDOW` (60 s) and that address is refused for `BAN_SECONDS` (600 s).
+  A refused address gets `auth_fail` with the time left, straight after
+  connecting, even with a right code. The session gets one NOTICE when an
+  address is refused.
+  - Per address and for a fixed time, not a lockout of the server until
+    restart: a global lockout is one any stranger on the LAN can trigger, at
+    will, against the people the proxy is for — and a daemon locked that way
+    needs someone at the machine to restart it.
+  - A right code clears that address's earlier failures, so a typo or two never
+    accumulates towards a refusal.
+  - A malformed hello or a non-`auth` first message counts as a failure; a
+    connection that closes without sending anything does not.
+  - Each connection already gets one attempt (S6), so the limit is on
+    connections, and a 16-hex-digit code is out of reach of guessing anyway;
+    the limit is what keeps a short *chosen* code (`--auth 123456`) safe too.
+- **A refused client stops instead of retrying.** `open()` raising
+  `SourceRefused` (the socket client's `AuthRefused` — a wrong code or a ban)
+  ends the session: one `error` STATUS with `refused: true`, then
+  `disconnected` with `reason: refused`. A retry would repeat the same wrong
+  code every `reconnect_interval` and ban itself within seconds — which is
+  exactly what happened when a `connect --serve` restarted with a fresh
+  generated code and its clients reconnected with the old one. A server that is
+  merely unreachable is still retried.
+- Clients behind one NAT share an address, so one of them guessing wrong
+  refuses the rest for the ban. Accepted: the alternative identities an
+  unauthenticated client can offer are all ones it chooses itself.
+
+**Acceptance**
+- `--serve` with no `--auth` yields one full-access code, never `123456`,
+  different on each run, at least 16 characters, printed; `--auth` codes are
+  used as given with nothing generated.
+- The limiter refuses an address on its Nth failure within the window, only
+  that address, for the ban and no longer; failures spaced beyond the window
+  never add up; a success clears earlier failures.
+- Through a real server: N wrong codes, then the right one is refused with
+  `try again in <N>s`, and one NOTICE names the address; alternating wrong and
+  right codes never refuses; malformed hellos count.
+
+## S23. Looking the auth code up again
+
+Since S22 a `--serve` without `--auth` prints a generated code once, at startup
+— and a terminal full of device output scrolls it away in seconds. Two places to
+find it again:
+
+- **`<prefix> i` in the TUI** raises the session's details as one toast: proxy
+  address, every code with its role, the `attach` name if registered, mirrors,
+  the log folder. Without a proxy it says so and how to get one.
+  - A **toast only**. Not written to the log view (what `Ctrl+W` copies and
+    people paste into tickets), and never published as a NOTICE — the proxy
+    forwards notices to every client, read-only ones included, which would hand
+    them the full-access code. The recorder never writes notices either way.
+  - The status bar shows `serve <addr> (<prefix> i)` — where to look, never the
+    code, since a status bar ends up in screenshots.
+- **The session registry** (S17) now also holds a foreground `connect --serve`
+  (`foreground: true`), in the same 0600 state file, under the device stem
+  (`-2`, `-3`… if a live session already has that name). It is removed on exit
+  and pruned like any other if the process dies. So, from any terminal:
+  - `status` lists it, marked `(foreground)`; `status --show-auth` (or
+    `--json --show-auth`) adds each code and role. Codes stay hidden otherwise,
+    with a line saying how to show them.
+  - `attach` joins it with the recorded code. A wildcard bind (`0.0.0.0`,
+    `::`) is reached on loopback (`127.0.0.1`, `::1`).
+  - `start` refuses its port, and S21's busy hint names it as a session "in
+    another terminal" rather than a background one.
+- State files gain `codes` (code → role; `auth` remains the one `attach` uses,
+  full access when there is one) and `foreground`. Older files load: `codes`
+  falls back to `{auth: full}`.
+- POSIX only, as the registry is: its liveness probe `os.kill(pid, 0)` would be
+  a Ctrl-C on Windows. A registry that cannot be written is a note on stderr,
+  never a failure to serve.
+
+**Acceptance**
+- `attach`'s code is the full-access one when there is one, else any.
+- `codes` / `foreground` round-trip; a file without them still shows its code.
+- Names are unique among live sessions; a dead session does not hold one.
+- `register_foreground` writes a 0600 file with the bound port, every code and
+  `foreground: true`; skips cleanly off POSIX; a write failure is a note.
+- The info lines name address, each code and role, `attach`, mirrors and logs.
+- `status` hides codes and says how to show them; `--show-auth` lists each with
+  its role; JSON carries `auth` only with `--show-auth`, and `foreground` always.
+- Through the Textual harness, in line and character mode: `<prefix> i` raises
+  exactly one toast with the code, and the code is in neither the log, the bus,
+  nor the status bar, which does name the serve address; with no proxy it
+  explains; `<prefix> ?` lists `i`.
+- A real `connect --serve --listen-port 0`: its generated code shows up in
+  `status --json --show-auth` from another process, a client joins with the
+  registry's details via loopback, and an ordered exit leaves no state file.
+  A 0.0.0.0 bind warns about the network; `--listen 127.0.0.1 --auth given`
+  neither warns nor generates.
+
+## S24. Fixed proxy codes in config.toml
+
+A generated code (S22) changes every run, so anyone connecting from elsewhere
+needs the new one after each restart; `--auth CODE` avoids that but puts the
+code where `ps` shows it to every local user and the shell history keeps it.
+
+```toml
+# ~/.uart-proxy/config.toml   (chmod 600)
+[proxy]
+auth = ["fixedcode", "look:readonly"]   # or one string
+```
+
+- Precedence, as for retention: `--auth` > `[proxy] auth` > a generated code.
+  `connect --serve` and `start` resolve it the same way, and `start` records
+  every code (S23), `attach` taking the full-access one.
+- Using config codes is said at startup (`Using N auth code(s) from …`).
+- **Fails safe to a generated code**, with a note on stderr, whenever the
+  setting cannot be trusted or read: the file is readable by group or others
+  (POSIX — a code in a world-readable file is not a secret); the value is not a
+  string or a list of non-empty strings; or Python is 3.10, which has no
+  `tomllib` — said rather than silently skipped.
+
+**Acceptance**
+- Config codes are used with their roles when `--auth` is absent; a single
+  string is one code; `--auth` wins and the config is not mentioned.
+- A mode-644 file, a malformed value, or a missing `tomllib` each give a note
+  and a generated code; no file, or no `[proxy]` section, gives a generated code
+  and no note.
+- A real `start` with config codes lists all of them in
+  `status --json --show-auth` and records the full-access one for `attach`.
+- The test suite never reads the developer's own config.toml.
+
+## S25. Log banners
+
+- The two timestamped files open with `#` lines — version, the source's
+  description (port, baud, framing), encoding, EOL, and the wall-clock time of
+  elapsed 0 with its UTC offset — and close with `# ended · <abs window> ·
+  <rel window>`. A `#` line can never be taken for a device line, which always
+  starts `[stamp]`.
+- The raw `output.log` never gets one: it is the device's bytes, byte for byte.
+- A session that adopted a remote timeline (S18) states the adopted origin.
+
+**Acceptance**: marks reach only the timestamped files; a device line starting
+`#` still gets its stamp; the header names version, source, encoding, EOL and a
+start with offset; the footer has both windows; a real `connect` recording opens
+and closes with them while `output.log` is exactly what was sent.
+
+## S26. Connection cap
+
+- `max_clients` (`--max-clients`, default 16, `0` = none) bounds connections
+  being served, **authenticated or not** — otherwise idle sockets that never
+  send `auth` could hold every slot for their 10 s grace each.
+- Over the cap: `auth_fail` with `retry: true` and `server full (N
+  connections)`, sent from the accept thread, then close. `retry: true` makes
+  the client raise a retryable error rather than S22's `AuthRefused`: full is
+  temporary. Being turned away never counts as an auth failure.
+
+**Acceptance**: the N+1th client is turned away with a retryable error; a slot
+frees when a client leaves; idle unauthenticated sockets count; turned-away
+attempts never ban; `0` admits 20; a waiting client gets in once a slot frees.
+
+## S27. Choosing the port
+
+- `connect` without `--port`: in a terminal (stdin and stdout both ttys, no
+  `--no-tui`) a picker lists the ports — path, VID:PID, description, and
+  `held by '<session>'` for one a session of ours holds; `r` rescans, Esc
+  cancels (`No port chosen.`, exit 1). Elsewhere the ports are listed on stderr
+  and the command fails: a script must never wait for a keypress.
+- `start` never asks — detached, nobody could answer.
+
+**Acceptance**: a given port is used without asking; a terminal asks; backing
+out says so; no terminal or `--no-tui` lists and fails; no ports says so;
+`start` without a port or profile fails without asking; in the picker Enter,
+↓+Enter, Esc, `r` after a plug-in, and an empty list behave.
+
+## S28. Searching the log
+
+- `<prefix> /` opens a search box (line mode; in character mode the log is
+  behind the device's screen and every key is the device's, so it says so).
+  Enter filters the log to matching lines, the match highlighted; lines that
+  arrive later are filtered live. An empty Enter restores the full log. The box
+  opens empty — the current pattern is in its placeholder — so that an empty
+  Enter really is one keystroke. Esc leaves the filter as it was.
+- **Smart case**: case-insensitive unless the pattern has a capital. Matching is
+  on the plain text, so `[red]` in device output is literal.
+- The status bar shows `filter '<p>' (<n>)`. `Ctrl+W` copies what is shown.
+  `<prefix> k` clears the lines and keeps the filter.
+- Rendered lines are kept alongside the plain copy buffer (both bounded, 5000),
+  so setting or clearing a filter rebuilds the view without losing anything.
+
+**Acceptance** (Textual harness): only matches shown; live filtering; an empty
+search restores lines that arrived while filtered; smart case; the status count;
+copy takes the shown lines; Esc keeps the filter and returns focus to the input;
+a reopened box is empty with the pattern named; nothing typed reaches the
+device; markup-like text matches literally; character mode explains instead;
+clear keeps the filter; `<prefix> ?` lists it.
+
+## S29. Echoing typed lines to proxy clients
+
+- `--echo-tx` (off by default) sends each completed TX line to clients as
+  `{"type": "tx_echo", "seq", "wall", "elapsed", "text"}` — lines, not
+  keystrokes, so character-mode typing arrives as the command. Off by default
+  because a line typed at a password prompt is a line.
+- Not sent to the client whose `tx` produced it: the TX event fires
+  synchronously inside that client's write, on its thread, which is how the
+  server knows (a thread-local). That client already shows its own line.
+- A client shows it as a TX line marked `remote` (`publish_remote_tx`) and never
+  writes it: it has already reached the device. Clients that don't know
+  `tx_echo` ignore it.
+
+**Acceptance**: off by default; on, a server-side line reaches clients; the
+typing client is not echoed and shows its line once; keystrokes echo as one
+line; read-only viewers get it; nothing is re-sent; an unaware client keeps
+streaming; the flag reaches the server; a typed line is a TX line for `\r`,
+`\r\n` and `\n`.
+
+## S30. Device profiles
+
+- `--profile NAME|FILE.toml` (`connect`, `start`) loads a `uart_helper`
+  profile — by name from `./uart-helper.d/` then `~/.config/uart-helper/`, or
+  by path.
+- `[defaults]` fill baud / bytesize / parity / stopbits and flow control
+  (`xonxoff`, `rtscts`, `dsrdtr`) where **no flag** is given. The flags
+  therefore default to None: `--baud 115200` with a 9600 profile means 115200.
+  Settled once (`start` before detaching; the `connect` it runs does not
+  reload).
+- `[[rules]]` find the port when `--port` is absent: one match is used (and
+  said); several go to the picker restricted to the matches, or — with nobody to
+  ask, and always for `start` — are listed and refused; none is an error.
+- An unknown or unparsable profile is an error naming it, never a traceback.
+
+**Acceptance**: built-in defaults without a profile; a profile by name or path
+sets the rest, flow control included; a flag beats it even at the default
+value; unknown and broken profiles are errors; settling is idempotent; one
+match is taken, none is said, several are offered (only those) or listed; an
+explicit port wins; a rules-free profile leaves the port to you; `start` with a
+non-matching profile fails before detaching, and with several refuses rather
+than asks.
+
+**Test safety**: in-process tests never see real ports or detach a daemon
+(`conftest.py` replaces the scan with `[]` and `daemonize` with a failure,
+unless a test is marked `real_ports` / `real_daemonize`). A test that scanned,
+found a developer's plugged-in adapter matching its profile, and detached a
+daemon onto it is why.

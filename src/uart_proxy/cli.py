@@ -33,14 +33,18 @@ from .core.daemon import (
     DAEMON_SUPPORTED,
     DaemonInfo,
     DaemonNotFound,
+    connect_host,
     daemonize,
     find_daemon,
     list_daemons,
     new_auth_code,
     prune_dead,
+    read_state,
     stop_daemon,
+    unique_name,
 )
 from .core.events import EventKind
+from .core.port_busy import describe_busy, same_device
 from .core.pty_proxy import (
     DEFAULT_MAX_LAG,
     DEFAULT_PROXY_COUNT,
@@ -67,10 +71,96 @@ from .ui.keymap import DEFAULT_PREFIX, normalise_prefix, prefix_label
 from .io.uart_source import UartSource
 from .plugins.manager import PluginManager
 from .proxy.protocol import Role, parse_auth_spec
-from .proxy.server import ProxyServer
+from .proxy.server import MAX_CLIENTS, ProxyServer
 
 
 # ── ports ─────────────────────────────────────────────────────────────────────
+
+
+def _scan_ports() -> list:
+    """The ports on this machine, as ``PortIdentity`` objects."""
+    return [ident for ident, _ in SerialMonitor().scan_once()]
+
+
+def port_choices(scan: Optional[Callable[[], list]] = None) -> list:
+    """The ports, described for the picker, with any our sessions hold marked."""
+    from .ui.port_picker import PortChoice
+
+    scan = scan or _scan_ports  # looked up now, so it can be replaced
+
+    try:
+        held = list_daemons() if DAEMON_SUPPORTED else []
+    except OSError:
+        held = []
+    choices = []
+    for ident in scan():
+        parts = []
+        if ident.vid is not None:
+            parts.append(ident.vid_pid_str)
+        if ident.description:
+            parts.append(f'"{ident.description}"')
+        holder = next((d for d in held if same_device(d.port, ident.tty_device)), None)
+        if holder is not None:
+            parts.append(f"(held by '{holder.name}' — attach instead)")
+        choices.append(PortChoice(ident.tty_device, "  ".join(parts)))
+    return choices
+
+
+def _have_terminal() -> bool:
+    """Whether someone is at a terminal to answer a question."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def resolve_port(args: argparse.Namespace,
+                 choose: Optional[Callable[[Callable[[], list]], Optional[str]]] = None,
+                 scan: Optional[Callable[[], list]] = None,
+                 *, allow_picker: bool = True) -> Optional[str]:
+    """``--port``, or one chosen from a list when it was left out (SPEC S27).
+
+    Only where someone can answer: without a terminal, or with ``--no-tui``,
+    the ports are listed and the command fails — a script that forgot
+    ``--port`` must not sit waiting for a keypress.
+    """
+    if args.port:
+        return args.port
+    # Looked up at call time, not bound as a default: a default is fixed when
+    # the function is defined, so replacing _scan_ports would not reach it.
+    scan = scan or _scan_ports
+    rules = getattr(args, "profile_rules", None) or []
+    if rules:
+        # The profile says which device it is for: take the one that matches.
+        full_scan = scan
+        scan = lambda: [p for p in full_scan() if any(r.matches(p) for r in rules)]  # noqa: E731
+        matched = scan()
+        name = getattr(args, "profile_name", "the profile")
+        if len(matched) == 1:
+            print(f"Profile '{name}' matched {matched[0].tty_device}", file=sys.stderr)
+            return matched[0].tty_device
+        if not matched:
+            print(f"Error: no connected port matches profile '{name}' "
+                  f"({len(rules)} rule(s)); plug it in, or pass --port.",
+                  file=sys.stderr)
+            return None
+    if not allow_picker or args.no_tui or not _have_terminal():
+        from .ui.port_picker import format_choice
+
+        choices = port_choices(scan)
+        why = ("several ports match the profile" if rules
+               else "no terminal to choose in")
+        print(f"Error: --port is required here ({why}).", file=sys.stderr)
+        if choices:
+            print("Ports on this machine:", file=sys.stderr)
+            for choice in choices:
+                print(f"  {format_choice(choice)}", file=sys.stderr)
+        else:
+            print("No serial ports found.", file=sys.stderr)
+        return None
+    if choose is None:
+        from .ui.port_picker import pick_port as choose
+    chosen = choose(lambda: port_choices(scan))
+    if chosen is None:
+        print("No port chosen.", file=sys.stderr)
+    return chosen
 
 
 def cmd_ports(args: argparse.Namespace) -> int:
@@ -171,12 +261,61 @@ def cmd_sessions(args: argparse.Namespace) -> int:
 # ── shared wiring ───────────────────────────────────────────────────────────
 
 
+#: Serial settings a flag, a profile, or these fill in — in that order.
+SERIAL_DEFAULTS = {"baud": 115200, "bytesize": 8, "parity": "N", "stopbits": 1.0}
+_PROFILE_FIELDS = {"baud": "baudrate", "bytesize": "bytesize",
+                   "parity": "parity", "stopbits": "stopbits"}
+
+
+def _load_profile(spec: str):
+    """A ``uart_helper`` profile by name, or by path to its ``.toml``."""
+    from uart_helper.config import load_profile, load_profile_by_name
+
+    if spec.endswith(".toml") or os.sep in spec or "/" in spec:
+        return load_profile(os.path.expanduser(spec))
+    return load_profile_by_name(spec)
+
+
+def apply_profile(args: argparse.Namespace) -> Optional[str]:
+    """Settle the serial settings, from ``--profile`` where flags are absent.
+
+    SPEC S30. The flags default to None so that "not given" can be told from
+    "given as the default": ``--profile lab --baud 9600`` must mean 9600 even
+    though 115200 is what the profile — and the built-in default — would say.
+    Returns an error message, or None. Idempotent: ``start`` settles these
+    before detaching, and the ``connect`` it runs must not redo it.
+    """
+    if getattr(args, "_serial_settled", False):
+        return None
+    profile = None
+    spec = getattr(args, "profile", None)
+    if spec:
+        try:
+            profile = _load_profile(spec)
+        except (FileNotFoundError, ValueError, ImportError) as exc:
+            return str(exc)
+    for flag, field_name in _PROFILE_FIELDS.items():
+        if getattr(args, flag, None) is None:
+            value = (getattr(profile.defaults, field_name) if profile is not None
+                     else SERIAL_DEFAULTS[flag])
+            setattr(args, flag, value)
+    defaults = profile.defaults if profile is not None else UARTConfig()
+    args.flow = {"xonxoff": defaults.xonxoff, "rtscts": defaults.rtscts,
+                 "dsrdtr": defaults.dsrdtr}
+    args.profile_rules = list(profile.rules) if profile is not None else []
+    args.profile_name = profile.name if profile is not None else None
+    args._serial_settled = True
+    return None
+
+
 def _build_config(args: argparse.Namespace) -> UARTConfig:
+    flow = getattr(args, "flow", {})
     return UARTConfig(
         baudrate=args.baud,
         bytesize=args.bytesize,
         parity=args.parity,
         stopbits=args.stopbits,
+        **flow,
     )
 
 
@@ -202,6 +341,48 @@ def _load_config() -> dict:
             return tomllib.load(fh)
     except Exception:  # noqa: BLE001
         return {}
+
+
+def config_auth_specs() -> list[str]:
+    """Fixed proxy codes from ``[proxy] auth`` in config.toml (SPEC S24).
+
+    For a code that survives restarts — so people connecting from elsewhere
+    are not sent a new one each time — without putting it on a command line,
+    where ``ps`` shows it to every local user and the shell history keeps it.
+    Refused, with a note, when the file is readable by others: a code in a
+    world-readable file is not a secret. Anything unusable yields [], which
+    means a generated code: failing safe.
+    """
+    if not os.path.isfile(CONFIG_PATH):
+        return []
+    try:
+        import tomllib  # noqa: F401
+    except ImportError:  # Python 3.10
+        print(f"Note: {CONFIG_PATH} needs Python 3.11+ (tomllib) to be read; "
+              f"ignoring it", file=sys.stderr)
+        return []
+    specs = _load_config().get("proxy", {}).get("auth")
+    if specs is None:
+        return []
+    if isinstance(specs, str):
+        specs = [specs]
+    if not isinstance(specs, list) or not all(isinstance(x, str) and x for x in specs):
+        print(f"Note: [proxy] auth in {CONFIG_PATH} must be a list of "
+              f"\"CODE[:role]\" strings; ignoring it", file=sys.stderr)
+        return []
+    if os.name == "posix":
+        mode = os.stat(CONFIG_PATH).st_mode & 0o777
+        if mode & 0o077:
+            print(f"Note: ignoring [proxy] auth — {CONFIG_PATH} is readable by "
+                  f"others (mode {mode:o}); 'chmod 600' it to use it",
+                  file=sys.stderr)
+            return []
+    return specs
+
+
+def resolve_auth_specs(args: argparse.Namespace) -> list[str]:
+    """``--auth`` if given, else config.toml's ``[proxy] auth``, else []."""
+    return list(args.auth or []) or config_auth_specs()
 
 
 def _resolve_retention(args: argparse.Namespace) -> tuple[float, int]:
@@ -239,8 +420,38 @@ def _attach_recorder(session: UartSession, args: argparse.Namespace) -> Optional
         include_tx=args.log_tx,
         append=args.log_append,
     )
+    for line in session_header(session, args):
+        recorder.mark(line)
     session.bus.subscribe(recorder.handle)
     return recorder
+
+
+def _utc_offset() -> str:
+    offset = time.strftime("%z")          # "+0800"
+    return f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
+
+
+def session_header(session: UartSession, args: argparse.Namespace) -> list[str]:
+    """The comment lines a recording opens with (SPEC S25).
+
+    Enough to read the file cold, months later: what produced it, from which
+    port with which settings, and when elapsed 0 was on the wall clock — the
+    elapsed column is meaningless without that.
+    """
+    start = session.tracker.start_wall.strftime("%Y-%m-%d %H:%M:%S")
+    eol = next((k for k, v in _EOL_MAP.items() if v == session.default_eol), "?")
+    return [
+        f"uart-proxy {__version__} · {session.source.description()}",
+        f"encoding {session.encoding} · eol {eol} · "
+        f"started {start} {_utc_offset()} (elapsed 0 = this instant)",
+    ]
+
+
+def session_footer(session: UartSession) -> str:
+    """The closing line: the whole window, in both time axes."""
+    end = session.tracker.stamp()
+    return (f"ended · {session.tracker.abs_window(end)} · "
+            f"{session.tracker.rel_window(end)}")
 
 
 def _build_plugins(session: UartSession, args: argparse.Namespace) -> PluginManager:
@@ -271,13 +482,19 @@ def _maybe_build_proxy(session: UartSession, args: argparse.Namespace) -> Option
     if not args.serve:
         return None
     auth: dict[str, Role] = {}
-    for spec in args.auth or []:
+    specs = resolve_auth_specs(args)
+    for spec in specs:
         code, role = parse_auth_spec(spec)
         auth[code] = role
+    if auth and not args.auth:
+        print(f"Using {len(auth)} auth code(s) from {CONFIG_PATH}.", file=sys.stderr)
     if not auth:
-        # A sensible default so --serve alone still works (full access).
-        auth["123456"] = Role.FULL
-        print("No --auth given; using default code 123456 (full access).", file=sys.stderr)
+        # --serve alone still works, but never with a code anyone could guess:
+        # it used to be a fixed 123456 with full access, on every interface.
+        code = new_auth_code()
+        auth[code] = Role.FULL
+        print(f"No --auth given; generated code {code} (full access).",
+              file=sys.stderr)
     # History for attaching clients (S18). Subscribed here rather than inside the
     # server so it fills from the moment the session starts, not from whenever a
     # client happens to connect.
@@ -285,7 +502,9 @@ def _maybe_build_proxy(session: UartSession, args: argparse.Namespace) -> Option
     if replay.enabled:
         session.bus.subscribe(replay.handle)
     return ProxyServer(session, auth, host=args.listen, port=args.listen_port,
-                       replay=replay if replay.enabled else None)
+                       replay=replay if replay.enabled else None,
+                       max_clients=getattr(args, "max_clients", MAX_CLIENTS),
+                       echo_tx=getattr(args, "echo_tx", False))
 
 
 def attach_exclusivity_report(
@@ -327,6 +546,37 @@ def attach_exclusivity_report(
                 f"exclusive: not claimed (--no-exclusive) — another program can "
                 f"open {path} and silently split the byte stream with us"
             )
+
+    session.bus.subscribe(on_event)
+
+
+def attach_busy_report(
+    session: UartSession,
+    source: UartSource,
+    describe: Callable[[str], str] = describe_busy,
+) -> None:
+    """Say who holds the port when opening it fails because it is in use.
+
+    The session retries a failed open every ``--reconnect-interval`` and reports
+    each attempt as ``waiting`` with the raw error — ``Resource busy`` — which is
+    true and useless. So the first busy attempt of a streak gets a NOTICE naming
+    the holder and what to do instead (SPEC S21): usually ``attach``, because
+    the usual holder is a background session of ours. Once per streak, because
+    ``describe`` may run ``lsof`` and the answer does not change every second;
+    a successful open ends the streak, so a later one is reported afresh.
+    """
+    reported = [False]
+
+    def on_event(event) -> None:
+        if event.kind is not EventKind.STATUS:
+            return
+        if event.text == "connected":
+            reported[0] = False
+        elif event.text == "waiting" and getattr(source, "busy", False):
+            if not reported[0]:
+                reported[0] = True
+                path = getattr(source, "device_path", "the port")
+                session.publish_notice(describe(path))
 
     session.bus.subscribe(on_event)
 
@@ -422,6 +672,81 @@ def _trap_sigterm():
     return _restore
 
 
+def _codes_by_role(proxy: ProxyServer) -> dict[str, str]:
+    return {code: role.value for code, role in proxy.auth.items()}
+
+
+def _best_code(codes: dict[str, str]) -> str:
+    """The code ``attach`` should use: full access if there is one."""
+    for code, role in codes.items():
+        if role == Role.FULL.value:
+            return code
+    return next(iter(codes), "")
+
+
+def register_foreground(args: argparse.Namespace, proxy: ProxyServer,
+                        log_dir: Optional[str]) -> Optional[DaemonInfo]:
+    """Put a ``connect --serve`` in the session registry (SPEC S23).
+
+    The generated auth code scrolls away with the terminal; the registry is
+    where ``status --show-auth`` and ``attach`` already look for a background
+    session's, so a foreground one goes there too — same 0600 file, removed on
+    exit, pruned by the next command if we die without tidying up.
+    POSIX only, like the registry's liveness check (``os.kill(pid, 0)`` is a
+    Ctrl-C on Windows, not a probe).
+    """
+    if not DAEMON_SUPPORTED:
+        return None
+    codes = _codes_by_role(proxy)
+    try:
+        prune_dead()
+        info = DaemonInfo(
+            name=unique_name(device_stem(args.port)), pid=os.getpid(),
+            port=args.port, baud=args.baud,
+            listen_host=args.listen, listen_port=proxy.port,
+            auth=_best_code(codes), codes=codes,
+            log_dir=log_dir, proxy_dir=getattr(args, "proxy_dir", None),
+            started_at=time.time(), version=__version__, foreground=True,
+        )
+        info.write()
+    except OSError as exc:
+        print(f"Note: not registered for 'uart-proxy status' ({exc})",
+              file=sys.stderr)
+        return None
+    return info
+
+
+def session_info_lines(
+    proxy: Optional[ProxyServer],
+    *,
+    listen: str,
+    registered: Optional[DaemonInfo] = None,
+    mirrors: Optional[PtyProxyGroup] = None,
+    log_dir: Optional[str] = None,
+) -> list[str]:
+    """What `<prefix> i` shows: how to reach this session, codes included.
+
+    Shown on this screen only, never published on the bus — a NOTICE is
+    forwarded to every proxy client, read-only ones too, and would hand them the
+    full-access code.
+    """
+    lines: list[str] = []
+    if proxy is not None:
+        lines.append(f"proxy    {listen}:{proxy.port}")
+        for code, role in _codes_by_role(proxy).items():
+            lines.append(f"auth     {code}  ({role})")
+    else:
+        lines.append("proxy    off (--serve to share this session)")
+    if registered is not None:
+        lines.append(f"attach   uart-proxy attach {registered.name}")
+    if mirrors is not None:
+        for mirror in mirrors.stats():
+            lines.append(f"mirror   {mirror.link}")
+    if log_dir:
+        lines.append(f"logs     {log_dir}")
+    return lines
+
+
 def _run_session(
     session: UartSession,
     args: argparse.Namespace,
@@ -469,6 +794,9 @@ def _run_session(
         # to report where clients can really reach us.
         args.listen_port = proxy.port
         print(f"Proxy listening on {args.listen}:{proxy.port}", file=sys.stderr)
+        if args.listen in ("0.0.0.0", "::", ""):
+            print("  (every interface — reachable from the network; "
+                  "--listen 127.0.0.1 keeps it on this machine)", file=sys.stderr)
     if mirrors is not None:
         session.bus.subscribe(mirrors.handle)
         mirrors.start()
@@ -478,6 +806,18 @@ def _run_session(
     # rather than killing us outright — mirror symlinks are the most visible
     # thing it would strand, but proxy clients and open log files matter too.
     restore_term = _trap_sigterm()
+
+    # A daemon registers itself (cmd_start); anything else serving does it here.
+    registered = None
+    if proxy is not None and not getattr(args, "daemon", False):
+        registered = register_foreground(args, proxy, log_dir)
+        if registered is not None:
+            print(f"Registered as '{registered.name}' — "
+                  f"'uart-proxy status --show-auth' shows the code again",
+                  file=sys.stderr)
+    info_lines = session_info_lines(proxy, listen=args.listen if proxy else "",
+                                    registered=registered, mirrors=mirrors,
+                                    log_dir=log_dir)
 
     # Everything a client needs is now in place (listening socket, mirrors), so
     # a detached start can report success — before the device is necessarily
@@ -498,11 +838,16 @@ def _run_session(
             run_tui(session, title=title, ts_mode=args.timestamp, log_hint=log_dir,
                     history=history() if history else None,
                     prefix=prefix, input_mode=getattr(args, "input", "line"),
-                    detachable=detachable)
+                    detachable=detachable, info=info_lines,
+                    serve_hint=(f"{args.listen}:{proxy.port}"
+                                if proxy is not None else None),
+                    mirror_stats=mirrors.stats if mirrors is not None else None)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
+        if registered is not None:
+            registered.remove()
         if restore_term is not None:
             restore_term()
         if mirrors is not None:
@@ -512,6 +857,7 @@ def _run_session(
         plugins.stop()
         session.stop()
         if recorder is not None:
+            recorder.mark(session_footer(session))
             written = close_recorder(recorder)
             if written:
                 print("Logs written:", file=sys.stderr)
@@ -525,6 +871,14 @@ def _run_session(
 
 def cmd_connect(args: argparse.Namespace,
                 on_ready: Optional[Callable[[], None]] = None) -> int:
+    error = apply_profile(args)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    port = resolve_port(args)
+    if port is None:
+        return 1
+    args.port = port
     config = _build_config(args)
     source = UartSource(args.port, config, exclusive=not args.no_exclusive)
     session = UartSession(
@@ -535,6 +889,7 @@ def cmd_connect(args: argparse.Namespace,
         reconnect_interval=args.reconnect_interval,
     )
     attach_exclusivity_report(session, source, requested=not args.no_exclusive)
+    attach_busy_report(session, source)
     return _run_session(session, args, title=f"uart-proxy · {args.port}",
                         on_ready=on_ready)
 
@@ -549,6 +904,21 @@ def cmd_start(args: argparse.Namespace) -> int:
               "use 'uart-proxy connect' in the foreground.", file=sys.stderr)
         return 1
 
+    error = apply_profile(args)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    # Nobody to ask once detached, and asking before would surprise a script:
+    # the port is --port, or the profile's one match.
+    if not args.port and not getattr(args, "profile_rules", None):
+        print("Error: start needs --port, or a --profile whose rules match a "
+              "connected port.", file=sys.stderr)
+        return 1
+    port = resolve_port(args, allow_picker=False)
+    if port is None:
+        return 1
+    args.port = port
+
     prune_dead()
     name = args.name or device_stem(args.port)
     try:
@@ -560,19 +930,32 @@ def cmd_start(args: argparse.Namespace) -> int:
               f"Attach to it, or stop it with 'uart-proxy stop {name}'.",
               file=sys.stderr)
         return 1
+    # A second daemon on a port the first one holds would sit in "waiting"
+    # forever, and succeed only in splitting the stream if the first opted out
+    # of the exclusive claim — so say where the port already is instead.
+    holder = next((d for d in list_daemons() if same_device(d.port, args.port)),
+                  None)
+    if holder is not None:
+        print(f"Error: {args.port} is already held by '{holder.name}' "
+              f"(pid {holder.pid}). Join it with 'uart-proxy attach "
+              f"{holder.name}', or stop it with 'uart-proxy stop {holder.name}'.",
+              file=sys.stderr)
+        return 1
 
     # Resolve where things land *before* detaching, so the state file can point
     # at them and the parent can report them.
     log_dir = None if args.no_log else _resolve_output_dir(args)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-    auth = (args.auth or [None])[0] or new_auth_code()
+    specs = resolve_auth_specs(args) or [new_auth_code()]
+    codes = {code: role.value for code, role in map(parse_auth_spec, specs)}
+    auth = _best_code(codes)
 
     # A daemon nobody can reach is useless, so it always serves — on loopback
     # unless asked otherwise, because a background process quietly listening on
     # every interface is not what anyone meant by "run it in the background".
     args.serve = True
-    args.auth = [auth]
+    args.auth = specs
     args.no_tui = True
     args.daemon = True
 
@@ -580,7 +963,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         name=name, pid=0, port=args.port, baud=args.baud,
         listen_host=args.listen, listen_port=args.listen_port, auth=auth,
         log_dir=log_dir, proxy_dir=args.proxy_dir, started_at=time.time(),
-        version=__version__,
+        version=__version__, codes=codes,
     )
 
     daemon_log = os.path.join(log_dir, "daemon.log") if log_dir else None
@@ -589,8 +972,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         """Printed by the parent, only once the child says it is up."""
         if args.quiet:
             return
+        # The port actually bound is only known in the child; it records it in
+        # the state file before saying it is up, so `--listen-port 0` reads back
+        # as the kernel's choice rather than as 0.
+        written = read_state(info.path)
+        port = written.listen_port if written is not None else args.listen_port
         print(f"Started '{name}' — {args.port} @ {args.baud}", file=sys.stderr)
-        print(f"  proxy    {args.listen}:{args.listen_port} (auth in {info.path})",
+        print(f"  proxy    {args.listen}:{port} (auth in {info.path})",
               file=sys.stderr)
         if log_dir:
             print(f"  logs     {log_dir}", file=sys.stderr)
@@ -643,7 +1031,7 @@ def _format_age(seconds: Optional[float]) -> str:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Show what is running in the background."""
+    """Show the sessions that are running — background, or serving in a terminal."""
     prune_dead()
     try:
         daemons = [find_daemon(args.name)] if args.name else list_daemons()
@@ -664,6 +1052,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "log_dir": d.log_dir, "proxy_dir": d.proxy_dir,
                     "started_at": d.started_at, "uptime": d.uptime,
                     "last_activity": d.last_activity(), "version": d.version,
+                    "foreground": d.foreground,
+                    **({"auth": _status_codes(d)} if args.show_auth else {}),
                 }
                 for d in daemons
             ],
@@ -671,7 +1061,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
 
     if not daemons:
-        print("No background session is running.")
+        print("No session is running.")
         print("Start one with:  uart-proxy start --port /dev/cu.usbserial-110")
         return 0
 
@@ -680,18 +1070,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     for d in daemons:
         last = d.last_activity()
         quiet_for = (now - last) if last else None
+        fg = "  (foreground)" if d.foreground else ""
         print(f"{d.name:16s} {d.pid:7d} {_format_age(d.uptime):>7s} "
-              f"{_format_age(quiet_for):>7s}  {d.port} @ {d.baud}")
+              f"{_format_age(quiet_for):>7s}  {d.port} @ {d.baud}{fg}")
     print()
     for d in daemons:
         print(f"{d.name}:")
         print(f"  proxy    {d.listen_host}:{d.listen_port}")
+        if args.show_auth:
+            for code, role in _status_codes(d).items():
+                print(f"  auth     {code}  ({role})")
         if d.log_dir:
             print(f"  logs     {d.log_dir}")
         if d.proxy_dir:
             print(f"  mirrors  {d.proxy_dir}")
         print(f"  state    {d.path}")
+    if not args.show_auth:
+        print("(auth codes hidden — add --show-auth)")
     return 0
+
+
+def _status_codes(d: DaemonInfo) -> dict[str, str]:
+    # State files from before codes were recorded carry only the one code.
+    return dict(d.codes) or ({d.auth: Role.FULL.value} if d.auth else {})
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -746,8 +1147,9 @@ def cmd_attach(args: argparse.Namespace) -> int:
     # A client, not a second owner: the daemon holds the port exclusively (S15),
     # so attaching means speaking its protocol — which is also what lets several
     # people attach at once.
+    host = connect_host(info.listen_host)
     source = SocketSource(
-        info.listen_host, info.listen_port, info.auth,
+        host, info.listen_port, info.auth,
         replay_lines=args.replay_lines,
     )
     # Connect here rather than leaving it to the session's background manager:
@@ -759,7 +1161,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         source.open()
     except Exception as exc:  # noqa: BLE001
         print(f"Error: cannot reach '{info.name}' at "
-              f"{info.listen_host}:{info.listen_port}: {exc}", file=sys.stderr)
+              f"{host}:{info.listen_port}: {exc}", file=sys.stderr)
         return 1
 
     session = UartSession(
@@ -770,6 +1172,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         reconnect_interval=args.reconnect_interval,
     )
     _adopt_remote_timeline(session, source)
+    source.on_tx_echo = session.publish_remote_tx
     args.serve = False
     # The daemon is already recording this session; a second copy under the
     # client would only duplicate it.
@@ -800,6 +1203,7 @@ def cmd_remote(args: argparse.Namespace) -> int:
         print(f"Error: cannot reach {args.host}:{args.port}: {exc}", file=sys.stderr)
         return 1
     _adopt_remote_timeline(session, source)
+    source.on_tx_echo = session.publish_remote_tx
     args.serve = False
     return _run_session(session, args,
                         title=f"uart-proxy · {args.host}:{args.port}",
@@ -885,17 +1289,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     # connect
     p_conn = sub.add_parser("connect", help="Open a local UART for read & write.")
-    p_conn.add_argument("--port", required=True, help="Serial device path or COM port.")
-    p_conn.add_argument("--baud", type=int, default=115200, help="Baud rate. Default 115200.")
-    p_conn.add_argument("--bytesize", type=int, default=8, choices=[5, 6, 7, 8])
-    p_conn.add_argument("--parity", default="N", choices=["N", "E", "O", "M", "S"])
-    p_conn.add_argument("--stopbits", type=float, default=1, choices=[1, 1.5, 2])
+    p_conn.add_argument("--port", default=None,
+                        help="Serial device path or COM port. Left out in a "
+                             "terminal, you choose from a list.")
+    p_conn.add_argument("--profile", metavar="NAME|FILE.toml", default=None,
+                        help="A uart_helper device profile: its [defaults] set "
+                             "baud/bytesize/parity/stopbits/flow control where "
+                             "no flag does, and its [[rules]] find the port "
+                             "when --port is left out.")
+    # None = not given, so a profile can fill it (apply_profile).
+    p_conn.add_argument("--baud", type=int, default=None, help="Baud rate. Default 115200.")
+    p_conn.add_argument("--bytesize", type=int, default=None, choices=[5, 6, 7, 8],
+                        help="Default 8.")
+    p_conn.add_argument("--parity", default=None, choices=["N", "E", "O", "M", "S"],
+                        help="Default N.")
+    p_conn.add_argument("--stopbits", type=float, default=None, choices=[1, 1.5, 2],
+                        help="Default 1.")
     p_conn.add_argument("--serve", action="store_true",
                         help="Also expose this session via a socket proxy.")
     p_conn.add_argument("--listen", default="0.0.0.0", help="Proxy bind address.")
     p_conn.add_argument("--listen-port", type=int, default=9600, help="Proxy port.")
+    p_conn.add_argument("--echo-tx", action="store_true",
+                        help="Show proxy clients each line typed into the device "
+                             "(by anyone). Off by default: that includes a "
+                             "password typed at a login prompt.")
+    p_conn.add_argument("--max-clients", type=int, default=MAX_CLIENTS,
+                        help=f"Proxy connections served at once; more are told "
+                             f"to retry. 0 = no cap. Default {MAX_CLIENTS}.")
     p_conn.add_argument("--auth", action="append", metavar="CODE[:role]",
-                        help="Auth code, optional role (full|readonly). Repeatable.")
+                        help="Auth code, optional role (full|readonly). Repeatable. "
+                             "Without it --serve generates a random full-access "
+                             "code for the run and prints it.")
     p_conn.add_argument("--no-exclusive", action="store_true",
                         help="Don't claim the port exclusively (TIOCEXCL). By "
                              "default nothing else on this machine can open it, "
@@ -958,19 +1382,34 @@ def build_parser() -> argparse.ArgumentParser:
                     "--listen says otherwise) with a generated auth code, so a "
                     "client can reach it later. See 'status' and 'stop'.",
     )
-    p_start.add_argument("--port", required=True, help="Serial device path.")
+    p_start.add_argument("--port", default=None,
+                         help="Serial device path (or let --profile find it).")
     p_start.add_argument("--name", default=None,
                          help="Name this session (default: the device stem, e.g. "
                               "usbserial-110).")
-    p_start.add_argument("--baud", type=int, default=115200, help="Baud rate. Default 115200.")
-    p_start.add_argument("--bytesize", type=int, default=8, choices=[5, 6, 7, 8])
-    p_start.add_argument("--parity", default="N", choices=["N", "E", "O", "M", "S"])
-    p_start.add_argument("--stopbits", type=float, default=1, choices=[1, 1.5, 2])
+    p_start.add_argument("--profile", metavar="NAME|FILE.toml", default=None,
+                        help="A uart_helper device profile: its [defaults] set "
+                             "baud/bytesize/parity/stopbits/flow control where "
+                             "no flag does, and its [[rules]] find the port "
+                             "when --port is left out.")
+    # None = not given, so a profile can fill it (apply_profile).
+    p_start.add_argument("--baud", type=int, default=None, help="Baud rate. Default 115200.")
+    p_start.add_argument("--bytesize", type=int, default=None, choices=[5, 6, 7, 8],
+                        help="Default 8.")
+    p_start.add_argument("--parity", default=None, choices=["N", "E", "O", "M", "S"],
+                        help="Default N.")
+    p_start.add_argument("--stopbits", type=float, default=None, choices=[1, 1.5, 2],
+                        help="Default 1.")
     p_start.add_argument("--listen", default="127.0.0.1",
                          help="Proxy bind address. Default 127.0.0.1 — a "
                               "background process should not listen on every "
                               "interface unless you say so.")
     p_start.add_argument("--listen-port", type=int, default=9600, help="Proxy port.")
+    p_start.add_argument("--echo-tx", action="store_true",
+                         help="Show attached clients each line typed into the "
+                              "device. Off by default (passwords are lines too).")
+    p_start.add_argument("--max-clients", type=int, default=MAX_CLIENTS,
+                         help=f"Proxy connections served at once. Default {MAX_CLIENTS}.")
     p_start.add_argument("--auth", action="append", metavar="CODE[:role]",
                          help="Auth code (default: a generated one, stored in the "
                               "session's 0600 state file).")
@@ -1007,10 +1446,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # status
     p_stat = sub.add_parser("status",
-                            help="Show the background sessions that are running.")
+                            help="Show running sessions: background ones, and "
+                                 "'connect --serve' in another terminal.")
     p_stat.add_argument("name", nargs="?", default=None,
                         help="Only this session (default: all).")
     p_stat.add_argument("--json", action="store_true", help="Emit JSON output.")
+    p_stat.add_argument("--show-auth", action="store_true",
+                        help="Also print each session's proxy auth codes.")
     p_stat.set_defaults(func=cmd_status)
 
     # stop
