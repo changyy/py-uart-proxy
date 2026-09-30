@@ -362,6 +362,7 @@ def test_no_config_file_means_a_generated_code(config, capsys):
     assert len(codes) == 1 and "generated code" in err
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="tomllib")
 def test_a_config_without_a_proxy_section_changes_nothing(config, capsys):
     config("[retention]\nmax_age_days = 3\n")
     codes, err = _codes(capsys)

@@ -228,6 +228,13 @@ class ProxyServer:
         if self._unsubscribe is not None:
             self._unsubscribe()
         if self._srv is not None:
+            # On Linux close() alone leaves the socket listening until the
+            # accept thread's poll returns, so the port cannot be bound again
+            # at once; shutdown() takes it out of LISTEN and wakes that thread.
+            try:
+                self._srv.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # macOS: ENOTCONN on a listening socket
             try:
                 self._srv.close()
             except OSError:
