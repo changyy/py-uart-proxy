@@ -1,5 +1,56 @@
 # Changelog
 
+## [1.20260930.1204523] — 2026-09-30
+
+The device can be anywhere now: a console server, ser2net or QEMU over TCP or
+RFC 2217, or anything reachable with ssh — a BBS included, drawn at the size
+of the window it is shown in.
+
+### Added
+- **`--port ssh://[USER@]HOST[:PORT]`** (SPEC S35): anything reachable with
+  `ssh -tt` as the device — SSH console servers, a UART on another machine
+  (`--ssh-command "picocom …"`), a BBS (`ssh://bbsu@ptt.cc`). Runs the system's
+  OpenSSH client in a pty, so keys, known_hosts, the agent and `~/.ssh/config`
+  apply and prompts are answered on screen. Starts in character mode; passes the
+  terminal view's size to the far end and follows resizes (`--term-size auto`,
+  the default; with `--no-tui`, the real terminal's size, followed on
+  SIGWINCH), or holds `--term-size 80x24`; `--ssh-option` passes `-o`. POSIX
+  only.
+
+### Changed
+- **Character mode hides the input box**, which takes no input there; its rows
+  go to the device's screen — and, over `ssh://`, to the far end's window.
+- **Network ports as the device** (SPEC S34): `--port socket://HOST:PORT` (raw
+  TCP: ser2net raw, `qemu -serial tcp::…`, Wi-Fi bridges) and
+  `--port rfc2217://HOST:PORT` (Telnet + RFC 2217: console servers, ser2net's
+  telnet mode — baud, framing and DTR/RTS are applied to the far port), for
+  `connect` and `start`. Waits for a server that isn't up and reconnects after a
+  drop; says on connecting that there is no exclusive claim to take. Mirrors
+  and sessions are named after the URL.
+- **`examples/check_hardware.py`** — the checks CI cannot run, against a real
+  adapter you name (or pick): the exclusive claim really refuses a second open
+  with `EBUSY`, on the node and its cu/tty twin; the busy hint, `start`'s
+  refusal and `status --show-auth` with a real session holding the port;
+  `--profile` matching by the adapter's own VID/PID; `--loopback` data;
+  `--replug` following it to a new name. It refuses to run while anything holds
+  the port, asks before opening it, and writes nothing unless `--loopback`.
+
+### Fixed
+- **What a network device said on connect could vanish.** pyserial's `open()`
+  ends by flushing input, which for a socket discards anything already
+  received — a console server's banner or `login:` prompt was lost whenever it
+  arrived before that flush (found as a test that failed only under load).
+  Opening a network port no longer flushes.
+- **Every headless session — and so every background `start` — exited on the
+  first dropped device.** Headless mode stopped on any `error` status, and
+  `error` is what a drop reports on its way to reconnecting; only a session that
+  was waiting from the start survived. It now ends on `disconnected` alone,
+  which a session always publishes when it really ends.
+- **A failed read looked like silence.** `uart_helper` reports a read error in
+  its result instead of raising, and `UartSource` returned the (empty) data —
+  so an adapter that failed mid-read could look merely quiet, and the session
+  would not reconnect. A read error now raises; only a timeout means "no data".
+
 ## [1.20260930.1202015] — 2026-09-30
 
 A replugged adapter is followed to its new name, a session that never ends can

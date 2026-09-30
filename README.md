@@ -103,8 +103,20 @@ python examples/check_char_mode.py       # character mode against a real bash (P
 ```
 
 A few behaviours can only be confirmed with a real adapter, because the pty
-driver ignores `TIOCEXCL` — see the manual checks in [SPEC.md](./SPEC.md)
-(S15, S21).
+driver ignores `TIOCEXCL`. For those, plug one in and run:
+
+```bash
+python examples/check_hardware.py /dev/tty.usbserial-110   # or no argument: pick from a list
+python examples/check_hardware.py DEV --replug              # + unplug/replug steps
+python examples/check_hardware.py DEV --loopback            # + data, TX jumpered to RX
+```
+
+It checks the exclusive claim (a second open really gets `EBUSY`), what a busy
+port reports, `--profile` matching, a session holding the port end to end, and —
+with `--replug` — following the adapter to a new name. It refuses to start if
+anything holds the port, asks before opening it (opening toggles DTR/RTS, which
+resets some boards), writes nothing unless `--loopback`, and keeps its sessions
+in a temporary `UART_PROXY_HOME`.
 
 ---
 
@@ -188,7 +200,7 @@ which no longer quits — so exactly **one** key is reserved as a command prefix
 | `Ctrl+] ?` | list the commands |
 | `Ctrl+] d` | **detach** — leave a background session running (see §7) |
 | `Ctrl+] q` | quit |
-| `Ctrl+] c` | switch character ⇄ line mode |
+| `Ctrl+] c` | switch character ⇄ line mode (character mode hides the input box, whose rows go to the device's screen) |
 | `Ctrl+] t` `y` `k` `w` `e` | timestamps · hex · clear · copy · select mode |
 | `Ctrl+] /` | **search** — show only the log lines containing a pattern (smart case), live; an empty search brings the full log back. Line mode only |
 | `Ctrl+] i` | session info — proxy address, **auth code(s)**, `attach` name, mirrors, logs (a toast only: never written to the log or sent to proxy clients) |
@@ -304,6 +316,75 @@ uart-proxy connect --port … --eol cr     # default: \r  (Unix console, login p
 uart-proxy connect --port … --eol crlf   # \r\n (some modems / AT firmwares)
 uart-proxy connect --port … --eol lf      # \n
 uart-proxy connect --port … --eol none    # send exactly what you typed
+```
+
+### Network ports: console servers, ser2net, QEMU
+
+A UART exposed as a TCP port — by a lab console server (Moxa, Digi, Lantronix,
+Cisco), `ser2net`, a Wi-Fi–serial bridge, or an emulator — can be the device
+itself, and then timestamps, logs, grep, search, mirrors, the proxy and
+background sessions all work on it:
+
+```bash
+uart-proxy connect --port socket://10.0.0.5:4001      # raw TCP
+uart-proxy connect --port rfc2217://10.0.0.5:7001     # Telnet + RFC 2217
+uart-proxy start   --port rfc2217://console1:7001 --name router
+```
+
+| Scheme | What it is | Serial settings (`--baud`, parity, …) |
+|---|---|---|
+| `socket://` | raw TCP — ser2net `raw`, `qemu -serial tcp::4444,server`, most Wi-Fi bridges | **the server's** — ours are not sent |
+| `rfc2217://` | Telnet with RFC 2217 COM-port control — ser2net `telnet`/rfc2217, most console servers | **applied to the far port**, so it behaves like a local one |
+
+- If the server isn't up yet, or drops the connection (a console server
+  rebooting, ser2net restarted), it waits and reconnects like an unplugged
+  adapter does.
+- What belongs to a local device doesn't apply: there is no exclusive claim to
+  take — the server decides who else may connect, and says so when connected —
+  no busy-port hint, and no following a replug.
+- Mirrors and background sessions are named after the URL
+  (`socket-10.0.0.5-4001-0`).
+- Plain `telnet://` (without RFC 2217) isn't supported yet: it needs Telnet
+  option negotiation, and until then a telnet server's control bytes would show
+  up as noise.
+
+#### Over SSH: `ssh://`
+
+Anything you reach with `ssh -tt` can be the device too — an SSH-based console
+server, a Raspberry Pi with the adapter plugged into it, a BBS:
+
+```bash
+uart-proxy connect --port ssh://admin@console1                    # a console server
+uart-proxy connect --port ssh://pi@lab \
+    --ssh-command "picocom -b 115200 /dev/ttyUSB0"                  # a UART on another machine
+uart-proxy connect --port ssh://bbsu@ptt.cc --term-size 80x24       # a BBS (UTF-8)
+```
+
+- It runs **your own OpenSSH client** in a pty, so keys, `known_hosts`, the
+  agent, `~/.ssh/config` and `ProxyJump` all behave exactly as for `ssh`. A
+  host-key question or a password prompt appears on screen: answer it there.
+- It starts in **character mode** (`--input line` to override): a shell or a
+  BBS reads keys, not lines, and full-screen programs need the terminal view.
+- Unlike a serial line, SSH **carries the window size**, and by default
+  (`--term-size auto`) the far end gets exactly the rows and columns the
+  terminal view has — your window minus uart-proxy's header, status bar and
+  footer — and follows it when you resize. With `--no-tui` it gets your
+  terminal's own size, likewise followed. `--term-size 80x24` fixes it instead:
+  what a BBS expects.
+- `--ssh-option OPT` passes `-o OPT` (e.g. `BatchMode=yes` for a background
+  session, which has nobody to type a password — use a key there).
+- If ssh exits it is run again, like a replugged adapter — for a BBS that means
+  a fresh login, not the screen you left.
+- Encoding is UTF-8; a Big5 BBS account is not supported. For PTT, use `bbsu`.
+- A full-screen program's log files are full of cursor-movement codes: the
+  terminal view is how to read it; `output.log` is still the complete record.
+- POSIX only (it needs a pty).
+
+Without hardware at hand, an emulator is a fake device that really boots:
+
+```bash
+qemu-system-arm … -serial tcp::4444,server,nowait
+uart-proxy connect --port socket://127.0.0.1:4444
 ```
 
 ### 3. Time axes & log files

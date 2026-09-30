@@ -287,6 +287,11 @@ if _TEXTUAL_AVAILABLE:
             # box in line mode, the log in character mode (a focused Input eats
             # printable keys before on_key ever sees them).
             self._show_view()
+            # A transport that can carry a window size (ssh, SPEC S35) is told
+            # the terminal view's, now and whenever it changes.
+            tell = getattr(self.session.source, "set_window_size", None)
+            if self._term is not None and tell is not None:
+                self._term.emulator.on_resize = tell
             # Layout is not settled yet, so the first honest size arrives here.
             self.call_after_refresh(self._sync_terminal_size)
             if self._char_mode or not self.session.source.writable:
@@ -294,6 +299,9 @@ if _TEXTUAL_AVAILABLE:
                 self._defocus_input()
             else:
                 self.query_one("#cmd", Input).focus()
+            # In character mode the box takes no input: give its row to the
+            # device's screen (and so to a far end that is told the size).
+            self.query_one("#cmd", Input).display = not self._char_mode
             self._note(f"{self._prefix_label} is the command prefix "
                        f"({self._prefix_label} ? for the list)")
             try:
@@ -743,6 +751,8 @@ if _TEXTUAL_AVAILABLE:
             self._char_mode = not self._char_mode
             inp = self.query_one("#cmd", Input)
             self._show_view()
+            # No input in character mode, so its row goes to the screen.
+            inp.display = not self._char_mode
             if self._char_mode:
                 # Focus has to leave the Input for printable keys to reach on_key.
                 inp.disabled = True

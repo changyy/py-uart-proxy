@@ -68,6 +68,9 @@ from .core.retention import (
     scan_sessions,
 )
 from .io.socket_source import SocketSource
+from .io.url_source import SCHEMES as URL_SCHEMES
+from .io.ssh_source import SshSource, parse_size
+from .io.url_source import UrlSource, check_port_url, is_port_url
 from .ui.keymap import DEFAULT_PREFIX, normalise_prefix, prefix_label
 from .io.uart_source import UartSource
 from .plugins.manager import PluginManager
@@ -574,6 +577,52 @@ def attach_busy_report(
     session.bus.subscribe(on_event)
 
 
+def _ssh_source(args: argparse.Namespace) -> Optional[SshSource]:
+    """An ``ssh://`` port (SPEC S35), or None after saying what is wrong."""
+    from .io.ssh_source import SSH_SUPPORTED
+
+    if not SSH_SUPPORTED:
+        print("Error: ssh:// needs a POSIX pty (macOS or Linux).", file=sys.stderr)
+        return None
+    size = None
+    if getattr(args, "term_size", None) and args.term_size.lower() != "auto":
+        try:
+            size = parse_size(args.term_size)
+        except ValueError as exc:
+            print(f"Error: --term-size: {exc}", file=sys.stderr)
+            return None
+    extra = []
+    for option in getattr(args, "ssh_option", None) or []:
+        extra += ["-o", option]
+    try:
+        return SshSource(args.port, command=getattr(args, "ssh_command", None),
+                         size=size, extra_args=extra)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return None
+
+
+def attach_network_note(session: UartSession, source) -> None:
+    """Say once, on connecting, what a network port does and doesn't give.
+
+    Where a local port reports its exclusive claim (S15), a network one has
+    none to report — and whether our baud reached the far port depends on the
+    scheme — so say which, rather than leave the local story implied.
+    """
+    said = [False]
+
+    def on_event(event) -> None:
+        if said[0] or event.kind is not EventKind.STATUS or event.text != "connected":
+            return
+        said[0] = True
+        scheme = source.device_path.split("://", 1)[0]
+        session.publish_notice(
+            f"network port ({URL_SCHEMES.get(scheme, scheme)}): no exclusive "
+            f"claim to take — the server decides who else may connect")
+
+    session.bus.subscribe(on_event)
+
+
 def attach_move_report(session: UartSession, source: UartSource) -> None:
     """Say so when the adapter came back under another name (SPEC S31).
 
@@ -856,7 +905,7 @@ def _run_session(
 
             run_tui(session, title=title, ts_mode=args.timestamp, log_hint=log_dir,
                     history=history() if history else None,
-                    prefix=prefix, input_mode=getattr(args, "input", "line"),
+                    prefix=prefix, input_mode=getattr(args, "input", None) or "line",
                     detachable=detachable, info=info_lines,
                     serve_hint=(f"{args.listen}:{proxy.port}"
                                 if proxy is not None else None),
@@ -899,7 +948,23 @@ def cmd_connect(args: argparse.Namespace,
         return 1
     args.port = port
     config = _build_config(args)
-    source = UartSource(args.port, config, exclusive=not args.no_exclusive)
+    if is_port_url(args.port):
+        # A serial port on the network (SPEC S34): console server, ser2net, QEMU.
+        error = check_port_url(args.port)
+        if error:
+            print(f"Error: {error}", file=sys.stderr)
+            return 1
+        if args.port.startswith("ssh://"):
+            source = _ssh_source(args)
+            if source is None:
+                return 1
+            # A shell or a BBS on the far end reads keys, not lines.
+            if getattr(args, "input", None) is None:
+                args.input = "char"
+        else:
+            source = UrlSource(args.port, config)
+    else:
+        source = UartSource(args.port, config, exclusive=not args.no_exclusive)
     session = UartSession(
         source,
         encoding=args.encoding,
@@ -907,9 +972,12 @@ def cmd_connect(args: argparse.Namespace,
         auto_reconnect=not args.no_reconnect,
         reconnect_interval=args.reconnect_interval,
     )
-    attach_exclusivity_report(session, source, requested=not args.no_exclusive)
-    attach_busy_report(session, source)
-    attach_move_report(session, source)
+    if isinstance(source, (UrlSource, SshSource)):
+        attach_network_note(session, source)
+    else:
+        attach_exclusivity_report(session, source, requested=not args.no_exclusive)
+        attach_busy_report(session, source)
+        attach_move_report(session, source)
     return _run_session(session, args, title=f"uart-proxy · {args.port}",
                         on_ready=on_ready)
 
@@ -1346,8 +1414,21 @@ def build_parser() -> argparse.ArgumentParser:
     # connect
     p_conn = sub.add_parser("connect", help="Open a local UART for read & write.")
     p_conn.add_argument("--port", default=None,
-                        help="Serial device path or COM port. Left out in a "
+                        help="Serial device path or COM port — or a network port: "
+                             "socket://HOST:PORT (raw TCP), rfc2217://HOST:PORT "
+                             "(console servers, ser2net, qemu) or "
+                             "ssh://[USER@]HOST[:PORT]. Left out in a "
                              "terminal, you choose from a list.")
+    p_conn.add_argument("--ssh-command", metavar="CMD", default=None,
+                        help="With --port ssh://…: run CMD on the far end instead "
+                             "of a login shell, e.g. \"picocom -b 115200 /dev/ttyUSB0\".")
+    p_conn.add_argument("--ssh-option", action="append", metavar="OPT",
+                        help="With --port ssh://…: pass -o OPT to ssh (repeatable).")
+    p_conn.add_argument("--term-size", metavar="COLSxROWS", default=None,
+                        help="With --port ssh://…: a fixed window size for the far "
+                             "end, e.g. 80x24 for a BBS, or 'auto' (the default): "
+                             "follow the terminal view — or, with --no-tui, the "
+                             "terminal itself.")
     p_conn.add_argument("--profile", metavar="NAME|FILE.toml", default=None,
                         help="A uart_helper device profile: its [defaults] set "
                              "baud/bytesize/parity/stopbits/flow control where "
@@ -1421,10 +1502,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="The TUI's command prefix, e.g. 'ctrl+]' (default) or "
                             "'ctrl+a'. Every other key can then go to the device; "
                             "press it twice to send it literally.")
-    p_conn.add_argument("--input", choices=("line", "char"), default="line",
+    p_conn.add_argument("--input", choices=("line", "char"), default=None,
                        help="Start in line mode (type a command, press Enter) or "
                             "character mode (every keystroke goes straight to the "
-                            "device, so ^C and tab completion work).")
+                            "device, so ^C and tab completion work). Default line; "
+                            "char for ssh://.")
     _add_common_io_args(p_conn)
     p_conn.set_defaults(func=cmd_connect)
 
@@ -1439,10 +1521,20 @@ def build_parser() -> argparse.ArgumentParser:
                     "client can reach it later. See 'status' and 'stop'.",
     )
     p_start.add_argument("--port", default=None,
-                         help="Serial device path (or let --profile find it).")
+                         help="Serial device path, socket://HOST:PORT or "
+                              "rfc2217://HOST:PORT (or let --profile find it).")
     p_start.add_argument("--name", default=None,
                          help="Name this session (default: the device stem, e.g. "
                               "usbserial-110).")
+    p_start.add_argument("--ssh-command", metavar="CMD", default=None,
+                        help="With --port ssh://…: run CMD on the far end instead "
+                             "of a login shell, e.g. \"picocom -b 115200 /dev/ttyUSB0\".")
+    p_start.add_argument("--ssh-option", action="append", metavar="OPT",
+                        help="With --port ssh://…: pass -o OPT to ssh (repeatable).")
+    p_start.add_argument("--term-size", metavar="COLSxROWS", default=None,
+                        help="With --port ssh://…: a fixed window size for the far "
+                             "end, e.g. 80x24 for a BBS. Default: follow the "
+                             "terminal view.")
     p_start.add_argument("--profile", metavar="NAME|FILE.toml", default=None,
                         help="A uart_helper device profile: its [defaults] set "
                              "baud/bytesize/parity/stopbits/flow control where "

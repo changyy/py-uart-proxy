@@ -195,3 +195,38 @@ def test_a_flapping_device_does_not_repeat_the_same_line():
     source.is_exclusive = False
     session.bus.publish(_connected())
     assert len(notices) == 2 and "COULD NOT claim" in notices[1]
+
+
+# ── a failed read is a failure, not silence ─────────────────────────────────
+
+
+def _source_reading(result):
+    source = UartSource("/dev/tty.fake", exclusive=False)
+    source._dev = SimpleNamespace(in_waiting=0, read=lambda *a, **k: result)
+    return source
+
+
+def test_a_read_error_raises_so_the_session_can_reconnect():
+    """uart_helper returns ok=False instead of raising; treating that as "no
+    data" would leave an unplugged adapter looking merely quiet, forever."""
+    from uart_helper.types import TransferResult
+
+    source = _source_reading(TransferResult(ok=False, error_code=3,
+                                            error_message="Read error: device gone"))
+    with pytest.raises(IOError, match="device gone"):
+        source.read(64, 0.1)
+
+
+def test_a_read_timeout_is_just_no_data():
+    from uart_helper.types import TransferResult
+
+    source = _source_reading(TransferResult(ok=False, error_code=2,
+                                            error_message="Read timeout"))
+    assert source.read(64, 0.1) == b""
+
+
+def test_a_good_read_returns_its_bytes():
+    from uart_helper.types import TransferResult
+
+    source = _source_reading(TransferResult(ok=True, data=b"hi", bytes_transferred=2))
+    assert source.read(64, 0.1) == b"hi"

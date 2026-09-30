@@ -116,6 +116,9 @@ class TerminalEmulator:
                 "pyte is not installed. Install it with:  pip install pyte"
             )
         self._screen = pyte.Screen(max(1, columns), max(1, lines))
+        #: Called with (columns, lines) after a real change of size — for a
+        #: transport that can tell the far end (ssh, SPEC S35).
+        self.on_resize = None
         self._stream = pyte.ByteStream(self._screen)
         self._style_cache: dict[tuple, Style] = {}
         # Rendering is skipped unless something moved, so a quiet device costs
@@ -145,6 +148,8 @@ class TerminalEmulator:
             return
         self._screen.resize(lines, columns)
         self._drawn_cursor = None  # force a redraw at the new size
+        if self.on_resize is not None:
+            self.on_resize(columns, lines)
 
     # ── input ───────────────────────────────────────────────────────────────
 

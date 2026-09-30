@@ -121,6 +121,17 @@ def device_stem(device: str) -> str:
     ``usbserial-110``, so the mirrors are named after the hardware rather than
     which of the two macOS aliases happened to be used.
     """
+    if "://" in device:
+        # A network port (SPEC S34): socket://10.0.0.5:4001 → socket-10.0.0.5-4001.
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(device)
+        host = (parts.hostname or "host").replace(":", "_")
+        try:
+            port = parts.port
+        except ValueError:
+            port = None
+        return f"{parts.scheme}-{host}" + (f"-{port}" if port else "")
     base = os.path.basename(device)
     for prefix in ("tty.", "cu."):
         if base.startswith(prefix):

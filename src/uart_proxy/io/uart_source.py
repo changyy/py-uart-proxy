@@ -23,6 +23,9 @@ from .source import DataSource
 
 logger = logging.getLogger(__name__)
 
+#: ``TransferResult.error_code`` for a read that timed out (uart_helper).
+_READ_TIMEOUT = 2
+
 #: TIOCEXCL is missing from ``termios`` on some builds; these are the values the
 #: two platforms we support actually use.
 _TIOCEXCL_FALLBACK = {"darwin": 0x2000740D, "linux": 0x540C}
@@ -128,8 +131,14 @@ class UartSource(DataSource):
         waiting = self._dev.in_waiting
         if waiting:
             result = self._dev.read(min(waiting, max_bytes))
-            return result.data
-        result = self._dev.read(1, timeout_ms=int(timeout * 1000))
+        else:
+            result = self._dev.read(1, timeout_ms=int(timeout * 1000))
+        # uart_helper reports a failed read in the result instead of raising.
+        # Returning its empty data would pass off an unplugged device as a
+        # quiet one, and the session would never reconnect; a timeout is the
+        # only failure that really means "nothing yet".
+        if not result.ok and result.error_code != _READ_TIMEOUT:
+            raise IOError(result.error_message or "UART read failed")
         return result.data
 
     def write(self, data: bytes) -> int:

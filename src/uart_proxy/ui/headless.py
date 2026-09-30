@@ -8,10 +8,12 @@ Honours the same timestamp display modes as the TUI.
 
 from __future__ import annotations
 
+import os
+import signal
 import sys
 import threading
 
-from typing import Optional
+from typing import Callable, Optional
 
 from ..core.events import Direction, Event, EventKind
 from ..core.replay import describe
@@ -48,6 +50,32 @@ def _print_history(entries: list, ts_mode: str) -> None:
     sys.stdout.flush()
 
 
+def follow_terminal_size(session: UartSession) -> Optional[Callable[[], None]]:
+    """Tell a transport that can take a window size (ssh, SPEC S35) the size
+    of the terminal we print to, now and on every SIGWINCH.
+
+    Nothing to do without one — a daemon's stdout is /dev/null — or when the
+    source has no use for it. Returns what restores the previous handler.
+    """
+    tell = getattr(session.source, "set_window_size", None)
+    if tell is None or not sys.stdout.isatty():
+        return None
+
+    def apply(*_signal) -> None:
+        try:
+            size = os.get_terminal_size(sys.stdout.fileno())
+        except OSError:
+            return
+        tell(size.columns, size.lines)
+
+    apply()  # before the session starts, so the far end's first look is right
+    if (not hasattr(signal, "SIGWINCH")
+            or threading.current_thread() is not threading.main_thread()):
+        return None
+    previous = signal.signal(signal.SIGWINCH, apply)
+    return lambda: signal.signal(signal.SIGWINCH, previous)
+
+
 def run_headless(session: UartSession, *, ts_mode: str = _TS_REL,
                  quiet: bool = False, history: Optional[list] = None) -> None:
     """Start the session and print its line stream until interrupted.
@@ -77,10 +105,16 @@ def run_headless(session: UartSession, *, ts_mode: str = _TS_REL,
             emit(meta_out, f"\033[33m* {event.text}\033[0m\n")
         elif event.kind == EventKind.STATUS:
             emit(meta_out, f"\033[36m# {event.text} {event.meta or ''}\033[0m\n")
-            if event.text in ("disconnected", "error"):
+            # Only the session's end: an `error` is a dropped device that the
+            # session is about to reconnect (S12). Ending on it made every
+            # background session exit on the first unplug. `disconnected` is
+            # always published when a session really ends — stop(), giving up
+            # without --reconnect, or a refusal.
+            if event.text == "disconnected":
                 stop.set()
 
     unsubscribe = session.bus.subscribe(on_event)
+    restore_winch = follow_terminal_size(session)
     try:
         session.start()
         while not stop.is_set():
@@ -92,3 +126,5 @@ def run_headless(session: UartSession, *, ts_mode: str = _TS_REL,
         # unsubscribing before it made the shutdown happen invisibly.
         session.stop()
         unsubscribe()
+        if restore_winch is not None:
+            restore_winch()

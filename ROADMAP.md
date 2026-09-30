@@ -85,13 +85,19 @@ The seven original requirements, implemented end to end.
   [`examples/check_char_mode.py`](./examples/check_char_mode.py).
   - 💡 Offer the terminal view in line mode too (a split, or a toggle
     independent of the input mode) — the emulator already tracks either way.
-  - 💡 Tell the device the window size where the transport can carry it: a
-    remote proxy client could send one, even though RS-232 cannot.
+  - ✅ Tell the far end the window size where the transport can carry it:
+    `ssh://` does (SPEC S35). A remote proxy client could too — still an idea.
+- ✅ **`ssh://` ports** (SPEC S35): the system's OpenSSH client in a pty — keys,
+  known_hosts and ssh config apply — with the window size passed on, for
+  SSH console servers, a UART on another machine, or a BBS.
 - ✅ **Port-busy hint** (SPEC S21): when opening the port fails because another
   process holds it, `connect` raises one NOTICE per busy streak naming the holder
   — a background session of ours from its state file (`attach` / its mirrors /
   `stop`), anything else from `lsof` — instead of a bare `Resource busy`.
   `start` refuses a second background session on a port one already holds.
+- ✅ **Network ports** (SPEC S34): `--port socket://HOST:PORT` (raw TCP) and
+  `rfc2217://HOST:PORT` (Telnet + COM-port control, settings applied remotely)
+  make a console server, ser2net or QEMU port the device.
 - ⬜ **Telnet IAC handling**: minimal negotiation so real telnet/BBS sessions
   render cleanly (currently raw passthrough).
 - ✅ **TUI port picker** (SPEC S27): `connect` without `--port` lists the ports

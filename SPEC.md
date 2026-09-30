@@ -101,6 +101,9 @@ completed. **RX** keeps `\n` only: a device's bare `\r` is a repaint.
   up is announced with `disconnected` (`reason: gave up`), exactly once even if
   `stop()` follows — headless mode ends on it, and without it waited forever.
 - `write()` while not connected raises (it cannot reach the device).
+- A UI ends with the session on `disconnected`, never on `error`: `error` is a
+  drop on its way to `reconnecting`. Headless mode once stopped on either, so
+  every background session exited on its first unplug.
 - Default baud is 115200 (CLI `--baud` optional); the effective baud is shown in
   the status bar via the source description.
 
@@ -370,7 +373,8 @@ themselves and were never the threat; unclaimed readers are.
   succeeds, a second open still works), so kernel enforcement needs a real tty.
   Verified by hand on macOS 15 against a PL2303 adapter and a spare
   `Bluetooth-Incoming-Port` node, producing the table above. To re-check after a
-  macOS or driver update: `uart-proxy connect --port /dev/cu.usbserial-110`, then
+  macOS or driver update, `python examples/check_hardware.py DEV` does all of
+  this (and S21, S23, S30, S31) against any adapter; by hand: `uart-proxy connect --port /dev/cu.usbserial-110`, then
   `python3 -c "import serial; serial.Serial('/dev/cu.usbserial-110')"` must raise
   `Resource busy` (errno 16) while `screen /tmp/uart-proxy/usbserial-110-0`
   attaches.
@@ -687,6 +691,8 @@ Two details that are easy to get wrong, both pinned by test:
   a filename in place, the typed command occupies one row rather than one per
   character, `^C` abandons the line, colour survives, and ↑ recalls from the
   shell's own history.
+- Character mode hides the (disabled) input box, and the screen takes its rows;
+  line mode shows it again.
 
 ## S21. When the port is busy, say who has it
 
@@ -1061,3 +1067,85 @@ deleted part 1.
 the links; a real `remote --proxy-dir` against an in-process server carries RX
 to the mirror and mirror input to the far device, and removes its link on exit;
 with a read-only code the device receives nothing and the refusal is printed.
+
+## S34. Network ports
+
+- `--port` may be a URL (`connect`, `start`): `socket://HOST:PORT` or
+  `rfc2217://HOST:PORT`, opened with pyserial's `serial_for_url` by a
+  `UrlSource`. Anything else with `://` is refused before anything starts,
+  naming the two that work; so is a URL without a host or port.
+- `socket://` is raw TCP: the serial settings are the server's, ours are not
+  sent, and the description says so. `rfc2217://` sends baud, framing and flow
+  control to the far port with Telnet COM-port control; Telnet's IAC byte in
+  the data is escaped both ways.
+- **Pitfalls pyserial sets**, pinned by test: its RFC 2217 client raises for any
+  `write_timeout`, so only raw TCP is given one; and setting `timeout` on an
+  open port reconfigures it — for RFC 2217 a round trip — so it is set only
+  when it changes, not on every read; and its `open()` ends by flushing input,
+  which for a socket discards what the server has already sent — a banner or
+  `login:` prompt sent on connect was lost whenever it beat the flush — so
+  `reset_input_buffer` is a no-op for the duration of `open()`.
+- A server that is not up is S12's absent device (`waiting`); a dropped
+  connection raises on read, so the session reconnects.
+- Local-device reporting does not apply and is not attached: no `TIOCEXCL`
+  (S15) — instead one NOTICE on connecting says there is no claim to take and
+  the server decides who may connect — no busy hint (S21), no following a
+  replug (S31).
+- Names: `device_stem` turns a URL into `scheme-host-port` for mirrors and the
+  session registry.
+- Not yet: plain `telnet://` needs option negotiation (the Telnet IAC item).
+
+**Acceptance**: URLs are told from device paths; the two schemes pass and
+others (and host- or port-less URLs) are refused with what works; stems are
+file-name safe; descriptions say whose settings apply. Against an in-process
+TCP device: both directions; a server not up yet is waited for; a dropped
+connection reconnects and is greeted again. Against pyserial's own RFC 2217
+`PortManager` over `loop://`: our baud and parity land on the far port; data
+including `0xFF` round-trips; reading does not reconfigure each time. The CLI
+refuses `telnet://` up front; a real `connect --port socket://…` records the
+server's output, names its mirror after the URL, says there is no exclusive
+claim, and puts the URL in the log banner.
+
+## S35. ssh:// ports
+
+- `--port ssh://[USER@]HOST[:PORT]` runs the **system's OpenSSH client** in a
+  pty (`ssh -tt`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`, `-p` only
+  when given, `--ssh-option` → `-o`, `--ssh-command` after `--`) and makes the
+  pty's master the device. Not an SSH implementation: keys, `known_hosts`, the
+  agent, FIDO keys, `~/.ssh/config` and `ProxyJump` behave as they do for `ssh`.
+- The child is started through a small shim that makes the pty its
+  **controlling terminal** (`TIOCSCTTY`) and sets its window size before ssh
+  starts, then execs ssh. ssh reads host-key answers and passwords from
+  `/dev/tty`, which needs one; a shim because `preexec_fn` is unsafe once the
+  parent has threads. `TERM` defaults to `xterm-256color`.
+- **Window size** (`--term-size auto`, the default): the terminal view's
+  emulator reports real size changes and the TUI passes them to a source that
+  can take one (`set_window_size` → `TIOCSWINSZ` → SIGWINCH → ssh forwards it).
+  The view is the window minus header, status bar and footer; in character mode
+  the input box is hidden and its rows go to the screen too. With `--no-tui` the
+  size is the real terminal's (`os.get_terminal_size`), set before ssh starts
+  and followed on SIGWINCH, the previous handler restored after; with no
+  terminal (a daemon) nothing is sent. `--term-size COLSxROWS` fixes it (a BBS
+  draws for 80×24) and every resize is ignored.
+- `connect` defaults to character mode for `ssh://` (`--input` overrides).
+- ssh exiting reads as a dropped device (`EIO`/EOF on the master, or the child
+  gone), so the session runs it again after `reconnect_interval`. `close()`
+  hangs up the pty, then SIGTERMs (and if need be SIGKILLs) ssh's process
+  group; nothing is left behind.
+- UTF-8 only; other encodings are left to the far end.
+
+**Acceptance**: URLs parse (user, `%3A`-escaped user, port, none); `ssh://`
+passes the port check without a port; the command line has `-tt`, keepalives,
+`-p`, extra options and the command after `--`, and leaves user and port to ssh
+config when absent; sizes parse and bad ones are refused; the stem names the
+host. Against a fake `ssh` first on PATH: it has a controlling terminal; typing
+reaches it; the initial size is there before it looks; `set_window_size`
+reaches it as a resize, but not with a fixed size; its exit raises `ssh exited
+(status 255)`; a session runs it again; `close()` leaves no process. The CLI
+builds an `SshSource`, applies `--term-size` and `--ssh-option`, defaults to
+character mode but respects `--input`, and refuses a bad size. Through the
+Textual harness the transport is told the terminal view's size and told again
+after a resize. A real `connect --port ssh://…` records the fake's output with
+the fixed size, names OpenSSH in its notice and the size in the log banner. By
+hand, the real `/usr/bin/ssh` against a closed local port: its error is shown
+and it is retried.

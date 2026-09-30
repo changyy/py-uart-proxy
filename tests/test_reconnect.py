@@ -157,3 +157,45 @@ def test_a_wait_after_a_drop_is_reported_afresh():
     source.drop()
     assert _wait_for(lambda: _statuses(events).count("waiting") == 2)
     session.stop()
+
+
+def test_headless_survives_a_dropped_device():
+    """`--no-tui` — and so every background session — used to exit on the first
+    `error` status, which is what a dropped device reports on its way to
+    reconnecting."""
+    import threading
+
+    from uart_proxy.ui.headless import run_headless
+
+    source = FakeSource()
+    session = UartSession(source, reconnect_interval=0.05)
+    runner = threading.Thread(target=run_headless, args=(session,),
+                              kwargs={"quiet": True}, daemon=True)
+    runner.start()
+    try:
+        assert _wait_for(lambda: session.is_connected)
+        opens = source.open_calls
+        source.drop()
+        assert _wait_for(lambda: source.open_calls > opens and session.is_connected)
+        time.sleep(0.2)
+        assert runner.is_alive(), "headless mode quit on a drop instead of reconnecting"
+    finally:
+        session.stop()
+    runner.join(timeout=3)
+    assert not runner.is_alive(), "…but it does end when the session ends"
+
+
+def test_headless_ends_when_reconnect_is_off_and_the_device_drops():
+    import threading
+
+    from uart_proxy.ui.headless import run_headless
+
+    source = FakeSource()
+    session = UartSession(source, auto_reconnect=False)
+    runner = threading.Thread(target=run_headless, args=(session,),
+                              kwargs={"quiet": True}, daemon=True)
+    runner.start()
+    assert _wait_for(lambda: session.is_connected)
+    source.drop()
+    runner.join(timeout=3)
+    assert not runner.is_alive()
