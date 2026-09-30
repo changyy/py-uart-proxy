@@ -127,6 +127,11 @@ mode (e.g. a mobile viewer).
 - A `tx` from a `readonly` client is rejected (the server returns a `notice` and
   does not write).
 - `ping` → server replies `{"type": "pong"}`.
+- `resize` (optional) — `{"type": "resize", "cols": 120, "rows": 36}`: the
+  client's window size, for a device that can carry one (`ssh://`,
+  `telnet://`). Honoured from `full` clients only; the latest wins; ignored for a
+  device that can't use it. A client sends it after authenticating and again on
+  every resize.
 
 ## Robustness expectations
 

@@ -10,6 +10,14 @@ Subscribes to the event bus and writes up to three files for a session:
   local wall-clock time and the relative elapsed time:
   ``[2026-06-12 08:40:20 | 00:00:10.0000] line``.
 
+* ``<base>-timing.log`` — beside the raw log, one row per chunk received,
+  ``<epoch> <elapsed> <bytes>``: when each run of bytes in the raw log arrived
+  — as UTC epoch seconds, so the file stands on its own and runs appended to
+  one folder stay in order, and as session elapsed, to match the timestamped
+  files — so
+  ``uart-proxy replay`` can play it back at its own pace (SPEC S37) — the way
+  ``script -t`` pairs with ``scriptreplay``.
+
 TX lines (what the operator typed) can optionally be mirrored into the
 timestamped files with a ``>>`` marker via ``include_tx``.
 
@@ -45,6 +53,7 @@ class Recorder:
         raw: bool = True,
         relative: bool = True,
         full: bool = True,
+        timing: bool = True,
         include_tx: bool = False,
         append: bool = False,
         rotate_bytes: int = 0,
@@ -53,7 +62,9 @@ class Recorder:
         os.makedirs(output_dir, exist_ok=True)
         self._include_tx = include_tx
         self._base = os.path.join(output_dir, base_name)
-        self._wanted = {"raw": raw, "relative": relative, "full": full}
+        # Timing only means something beside the raw bytes it times.
+        self._wanted = {"raw": raw, "relative": relative, "full": full,
+                        "timing": timing and raw}
         self.rotate_bytes = rotate_bytes
         self.keep_parts = keep_parts
         #: Finished parts, oldest first: each a list of the paths it holds.
@@ -67,10 +78,12 @@ class Recorder:
         self._raw_f: TextIO | None = None  # opened in binary; typed loosely
         self._rel_f: TextIO | None = None
         self._full_f: TextIO | None = None
+        self._timing_f: TextIO | None = None
 
         self.raw_path = f"{self._base}.log"
         self.relative_path = f"{self._base}-timestamp.log"
         self.full_path = f"{self._base}-fulltimestamp.log"
+        self.timing_path = f"{self._base}-timing.log"
         self._open_files(append=append)
 
     def _open_files(self, *, append: bool) -> None:
@@ -82,6 +95,8 @@ class Recorder:
             self._rel_f = open(self.relative_path, text_mode, encoding="utf-8")  # noqa: SIM115
         if self._wanted["full"]:
             self._full_f = open(self.full_path, text_mode, encoding="utf-8")  # noqa: SIM115
+        if self._wanted["timing"]:
+            self._timing_f = open(self.timing_path, text_mode, encoding="utf-8")  # noqa: SIM115
 
     def handle(self, event: Event) -> None:
         """Bus subscriber entry point."""
@@ -89,6 +104,13 @@ class Recorder:
             if event.kind == EventKind.DATA and self._raw_f is not None:
                 self._raw_f.write(event.data)
                 self._raw_f.flush()
+                if self._timing_f is not None:
+                    # The wall time is derived from the monotonic clock (S2),
+                    # so within a run it never goes backwards either.
+                    epoch = event.stamp.wall.timestamp()
+                    self._timing_f.write(
+                        f"{epoch:.4f} {event.stamp.elapsed:.4f} {len(event.data)}\n")
+                    self._timing_f.flush()
                 self._count(len(event.data))
             elif event.kind == EventKind.LINE:
                 self._write_line(event, marker="")
@@ -148,7 +170,7 @@ class Recorder:
         import re
 
         directory, base = os.path.split(self._base)
-        pattern = re.compile(rf"^{re.escape(base)}(?:-timestamp|-fulltimestamp)?"
+        pattern = re.compile(rf"^{re.escape(base)}(?:-timestamp|-fulltimestamp|-timing)?"
                              rf"\.(\d{{3,}})\.log$")
         highest = 0
         try:
@@ -201,13 +223,13 @@ class Recorder:
         self._close_files()
 
     def _close_files(self) -> None:
-        for f in (self._raw_f, self._rel_f, self._full_f):
+        for f in (self._raw_f, self._rel_f, self._full_f, self._timing_f):
             if f is not None:
                 try:
                     f.close()
                 except Exception:  # noqa: BLE001
                     logger.warning("Error closing recorder file", exc_info=True)
-        self._raw_f = self._rel_f = self._full_f = None
+        self._raw_f = self._rel_f = self._full_f = self._timing_f = None
 
     @property
     def paths(self) -> list[str]:
@@ -218,4 +240,6 @@ class Recorder:
             out.append(self.relative_path)
         if self._full_f is not None:
             out.append(self.full_path)
+        if self._timing_f is not None:
+            out.append(self.timing_path)
         return out

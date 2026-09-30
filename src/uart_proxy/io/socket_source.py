@@ -22,6 +22,7 @@ fire every grep rule again on output from an hour ago.
 from __future__ import annotations
 
 import socket
+import threading
 import time
 
 from ..core.replay import ReplayEntry
@@ -69,6 +70,11 @@ class SocketSource(DataSource):
         self.remote_elapsed: float | None = None
         #: Called with each `tx_echo` line, if the server sends them (S29).
         self.on_tx_echo = None
+        #: Our window size, sent to the server (S38); kept across reconnects.
+        self._window: tuple[int, int] | None = None
+        # tx and resize can come from different threads (the UI, a mirror);
+        # two sendall()s at once could interleave their lines on the wire.
+        self._send_lock = threading.Lock()
 
     def open(self) -> None:
         # Idempotent: `attach` connects up front so the replayed history is in
@@ -114,6 +120,8 @@ class SocketSource(DataSource):
         if self._replay_lines > 0:
             self._collect_replay()
         sock.settimeout(0.2)
+        if self._window is not None:
+            self._send_window()
 
     def close(self) -> None:
         if self._sock is not None:
@@ -153,8 +161,27 @@ class SocketSource(DataSource):
             raise SocketSourceError("not connected")
         if self.role == Role.READONLY:
             raise SocketSourceError("remote session is read-only; writes are not allowed")
-        self._sock.sendall(encode_message({"type": "tx", "hex": data.hex()}))
+        with self._send_lock:
+            self._sock.sendall(encode_message({"type": "tx", "hex": data.hex()}))
         return len(data)
+
+    def set_window_size(self, cols: int, rows: int) -> None:
+        """Tell the server our size, for a device that can use one (S38)."""
+        self._window = (cols, rows)
+        if self._sock is not None:
+            self._send_window()
+
+    def _send_window(self) -> None:
+        # A read-only client may not reshape the device; don't ask.
+        if self.role != Role.FULL or self._window is None or self._sock is None:
+            return
+        cols, rows = self._window
+        try:
+            with self._send_lock:
+                self._sock.sendall(encode_message({"type": "resize", "cols": cols,
+                                                   "rows": rows}))
+        except OSError:
+            pass
 
     def description(self) -> str:
         base = f"remote {self._host}:{self._port}"

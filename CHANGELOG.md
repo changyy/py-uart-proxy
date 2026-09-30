@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.20260930.1205413] — 2026-09-30
+
+Telnet joins the network ports, and a session can be watched again as it
+happened — a full-screen program included.
+
+### Added
+- **`--port telnet://HOST[:PORT]`** (SPEC S36): a BBS (`telnet://ptt.cc`), a
+  router's CLI, a console server in plain telnet mode. Option negotiation is
+  answered rather than shown — echo and SGA accepted, terminal type and window
+  size (NAWS) offered, everything else refused, a change only ever answered
+  once so the two sides cannot loop — IAC and CR NUL are framed both ways, and
+  the window size follows the terminal view (or `--term-size`). Character mode
+  by default.
+- **`uart-proxy replay [PATH]`** (SPEC S37): plays a recorded session back at
+  its own pace through the terminal emulator — pause, seek, speed, and the
+  wall-clock time of the moment on screen — so a full-screen program reads as
+  it looked. `--no-tui` plays it into your terminal instead, like
+  `scriptreplay`; `--max-idle` cuts long silences short.
+- **`output-timing.log`**, beside `output.log`: when each run of its bytes
+  arrived, as `<epoch> <elapsed> <bytes>` — absolute UTC time, so the file
+  stands on its own and runs appended to one folder keep their order and pace,
+  and session elapsed, to match the timestamped logs. It is what `replay` plays
+  from, and it rotates into parts with the other files.
+- **`replay --at TIME`**, and `g` in the player: start at, or jump to,
+  `+00:47:15` (elapsed), `03:12:30` (time of day) or `2026-09-30 03:12:30` —
+  grep the timestamped log for the moment, then watch it.
+- **A proxy client's window size reaches the device** (SPEC S38): `remote` and
+  `attach` send theirs (`{"type": "resize"}`, an optional protocol message), so
+  an `ssh://` or `telnet://` session served elsewhere is drawn for the window
+  you are looking at. Full-access clients only; the latest wins.
+
 ## [1.20260930.1204523] — 2026-09-30
 
 The device can be anywhere now: a console server, ser2net or QEMU over TCP or

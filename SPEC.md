@@ -1149,3 +1149,102 @@ after a resize. A real `connect --port ssh://…` records the fake's output with
 the fixed size, names OpenSSH in its notice and the size in the log banner. By
 hand, the real `/usr/bin/ssh` against a closed local port: its error is shown
 and it is retried.
+
+## S36. telnet:// ports
+
+- `--port telnet://HOST[:PORT]` (port 23 by default): a TCP connection with
+  `TelnetProtocol` — framing and negotiation with no I/O, tested byte by byte —
+  between it and the session.
+- **Negotiation** (RFC 854/855; RFC 1143's rule of answering only a *change*,
+  so two sides can never loop): the server may `WILL` ECHO, SGA and BINARY (we
+  answer `DO`); we `WILL` NAWS, TTYPE, SGA and BINARY when asked (`DO`); the
+  rest is refused with `DONT`/`WONT`; a withdrawal is confirmed only for what
+  was on. `SB TTYPE SEND` gets `XTERM-256COLOR`. `DO NAWS` gets our size at
+  once, and every later resize sends it again (unless `--term-size` fixes it).
+  Other commands (NOP, GA, …) are dropped. Commands split across reads are
+  understood.
+- **Framing**: `IAC IAC` is a literal 0xFF both ways; outside binary mode a bare
+  CR is sent as `CR NUL` and `CR NUL` received is a CR.
+- Each connection negotiates afresh, keeping the last size. A dropped
+  connection reconnects (S12). Character mode by default, like `ssh://`.
+
+**Acceptance**: every rule above as a byte-level test of `TelnetProtocol`;
+against an in-process server that negotiates like a BBS, the device log holds
+only `login: `, and the server receives DO ECHO, DO SGA, WILL NAWS with the
+size, and the terminal type; typing arrives framed; a resize is sent as NAWS,
+but not with a fixed size; a drop reconnects and negotiates again; the CLI
+builds a `TelnetSource` in character mode; a real `connect --port telnet://…`
+records no negotiation bytes.
+
+## S37. Replay
+
+- The recorder writes `<base>-timing.log` beside the raw log: one row
+  `<epoch> <elapsed> <bytes>` per RX chunk. The epoch (UTC seconds, from the
+  monotonic-anchored wall clock of S2, so it never goes backwards within a run)
+  makes the file stand on its own and keeps runs appended to one folder in
+  order — elapsed alone restarts at 0 for each, and a second run would be
+  squashed into an instant. Elapsed matches the timestamped files. It rotates
+  with the other files (S32). No banner: it is data. The first two-column
+  format (`<elapsed> <bytes>`) still loads, its wall clock from the banner.
+- `uart-proxy replay [PATH]` — a session folder, a raw `output*.log` (a part
+  finds its own `output-timing.NNN.log`), or by default the newest session in
+  the store. `Recording` maps playback position to bytes; the banner (S25)
+  gives the wall-clock time of each moment. A timing file cut short has the
+  rest of the bytes appended at its end; one claiming more than exists is
+  trimmed; without one, the recording plays all at once, with a note.
+- The TUI player feeds bytes through the terminal emulator (S20) as their time
+  comes: Space pauses (and at the end, plays again), ←/→ seek 5 s — backwards
+  resets the screen and re-feeds from the start — `+`/`-` step through speeds
+  ×0.25…×64, Home/End jump. `--term-size` holds a size whatever the window
+  does. The status bar shows position / duration, speed, wall-clock time and
+  screen size.
+- `--no-tui` writes the bytes to stdout at their pace, for the terminal to draw
+  (as `scriptreplay`).
+- Silences longer than `--max-idle` (2 s; 0 keeps them) are cut to that.
+- **Going to a moment**: `--at TIME`, and `g` in the player (a box; Enter goes,
+  Esc closes it without quitting, and while it is open no key drives playback).
+  `+HH:MM:SS` / `+SECONDS` is session elapsed — the first run's, when runs were
+  appended — interpolated within a chunk's gap; `HH:MM:SS` is that time of day
+  on the recording's first day that has it, or the next for one that crosses
+  midnight; `YYYY-mm-dd HH:MM:SS` is exact. A time of day needs a wall clock
+  (three-column timing, or a banner). Everything before the moment is drawn at
+  once; `--at` outside the recording is an error.
+
+**Acceptance**: loading gives the bytes, times and duration; positions map to
+bytes; the wall clock comes from the banner; without timing everything is at
+position 0; inconsistent timing is made consistent; a part finds its timing;
+resolving takes a file, a folder or the newest session, and fails clearly. The
+stream player writes every byte with the recorded gaps, scaled by speed and
+capped by `max_idle`. The TUI player (driven by a fake clock) plays in time and
+stops at the end; cuts silences; pause holds; End/Home seek both ways into a
+clean screen; speed steps; Space at the end restarts; the status names position,
+wall time and speed; a fixed size survives a resize; a full-screen redraw
+replays as drawn-over text. The CLI reports an empty store and a missing timing
+file. End to end: a real recording, replayed with `--no-tui`, produces the
+recorded bytes exactly. The recorder writes epoch, elapsed and bytes; a
+three-column file needs no banner; appended runs keep order and their own gaps;
+the two-column format still plays. `--at` reads elapsed, time of day, a moment
+and a time past midnight, rejects nonsense, and refuses a time of day without a
+wall clock; the stream player and the TUI start at a moment; `g` jumps, Esc
+closes without quitting and space is typed rather than obeyed, and a bad time is
+said.
+
+## S38. A proxy client's window size
+
+- Client → server `{"type": "resize", "cols", "rows"}` (optional; older servers
+  ignore unknown types). `SocketSource.set_window_size` sends it — after
+  authenticating if set before, again after every reconnect — so the TUI's and
+  headless mode's size-following (S35) reaches a device served elsewhere.
+  Read-only clients do not send it.
+- The server applies it to a source that can take a size (`ssh://`,
+  `telnet://`), from `full` clients only — the size shapes what the device draws
+  for everyone — ignoring nonsense (non-integers, outside 2…1000). The latest
+  wins. For any other device it is ignored.
+- Sends on the client socket are serialized: tx and resize can come from
+  different threads, and two `sendall`s at once could interleave on the wire.
+
+**Acceptance**: a full client's size reaches the device; one set before
+connecting is sent on connect and again after a reconnect; a read-only client
+neither sends it nor, if it does, has it applied; nonsense is ignored; a device
+without sizes keeps the client; and the whole chain — client → proxy →
+`telnet://` → the far telnet server — delivers NAWS with the client's size.

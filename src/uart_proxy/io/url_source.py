@@ -38,6 +38,7 @@ SCHEMES = {
     "socket": "raw TCP — serial settings are the server's",
     "rfc2217": "Telnet + RFC 2217 — serial settings are applied remotely",
     "ssh": "OpenSSH — keys, known_hosts and ~/.ssh/config apply",
+    "telnet": "telnet — option negotiation handled, window size sent",
 }
 
 
@@ -56,8 +57,9 @@ def check_port_url(url: str) -> Optional[str]:
         port = parts.port
     except ValueError:
         return f"port URL {url!r} has a bad port"
-    if parts.scheme == "ssh":  # the port is ssh's business (default 22, config)
-        return None if parts.hostname else f"ssh URL {url!r} needs a host, e.g. ssh://user@host"
+    if parts.scheme in ("ssh", "telnet"):  # both have a default port
+        return None if parts.hostname else (
+            f"{parts.scheme} URL {url!r} needs a host, e.g. {parts.scheme}://host")
     if not parts.hostname or port is None:
         return f"port URL {url!r} needs a host and a port, e.g. {parts.scheme}://host:4001"
     return None

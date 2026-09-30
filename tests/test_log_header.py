@@ -62,7 +62,7 @@ def test_marks_are_skipped_for_files_not_recorded(tmp_path):
     recorder = Recorder(str(tmp_path), relative=False, full=False)
     recorder.mark("nothing to write to")
     recorder.close()
-    assert sorted(os.listdir(tmp_path)) == ["output.log"]
+    assert sorted(os.listdir(tmp_path)) == ["output-timing.log", "output.log"]
 
 
 # ── what the header and footer say ──────────────────────────────────────────

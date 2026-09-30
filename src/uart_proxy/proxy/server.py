@@ -419,6 +419,29 @@ class ProxyServer:
                 self._handle_tx(client, msg)
             elif mtype == "ping":
                 client.enqueue(encode_message({"type": "pong"}))
+            elif mtype == "resize":
+                self._handle_resize(client, msg)
+
+    def _handle_resize(self, client: _Client, msg: dict) -> None:
+        """A client's window size, for a device that can use one (SPEC S38).
+
+        Only ``ssh://`` and ``telnet://`` sources can tell the far end; for a
+        UART it is ignored. Full-access clients only — the size shapes what the
+        device draws for everyone, and a read-only viewer may not change what
+        the device does. The latest size wins, as when one person resizes a
+        shared tmux window.
+        """
+        if client.role != Role.FULL:
+            return
+        tell = getattr(self.session.source, "set_window_size", None)
+        if tell is None:
+            return
+        try:
+            cols, rows = int(msg.get("cols")), int(msg.get("rows"))
+        except (TypeError, ValueError):
+            return
+        if 2 <= cols <= 1000 and 2 <= rows <= 1000:
+            tell(cols, rows)
 
     def _handle_tx(self, client: _Client, msg: dict) -> None:
         if client.role != Role.FULL:

@@ -70,6 +70,7 @@ from .core.retention import (
 from .io.socket_source import SocketSource
 from .io.url_source import SCHEMES as URL_SCHEMES
 from .io.ssh_source import SshSource, parse_size
+from .io.telnet_source import TelnetSource
 from .io.url_source import UrlSource, check_port_url, is_port_url
 from .ui.keymap import DEFAULT_PREFIX, normalise_prefix, prefix_label
 from .io.uart_source import UartSource
@@ -577,6 +578,30 @@ def attach_busy_report(
     session.bus.subscribe(on_event)
 
 
+def _term_size(args: argparse.Namespace) -> tuple[bool, Optional[tuple[int, int]]]:
+    """``--term-size``: (ok, size), size None for ``auto`` (follow the view)."""
+    text = getattr(args, "term_size", None)
+    if not text or text.lower() == "auto":
+        return True, None
+    try:
+        return True, parse_size(text)
+    except ValueError as exc:
+        print(f"Error: --term-size: {exc}", file=sys.stderr)
+        return False, None
+
+
+def _telnet_source(args: argparse.Namespace) -> Optional[TelnetSource]:
+    """A ``telnet://`` port (SPEC S36), or None after saying what is wrong."""
+    ok, size = _term_size(args)
+    if not ok:
+        return None
+    try:
+        return TelnetSource(args.port, size=size)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return None
+
+
 def _ssh_source(args: argparse.Namespace) -> Optional[SshSource]:
     """An ``ssh://`` port (SPEC S35), or None after saying what is wrong."""
     from .io.ssh_source import SSH_SUPPORTED
@@ -584,13 +609,9 @@ def _ssh_source(args: argparse.Namespace) -> Optional[SshSource]:
     if not SSH_SUPPORTED:
         print("Error: ssh:// needs a POSIX pty (macOS or Linux).", file=sys.stderr)
         return None
-    size = None
-    if getattr(args, "term_size", None) and args.term_size.lower() != "auto":
-        try:
-            size = parse_size(args.term_size)
-        except ValueError as exc:
-            print(f"Error: --term-size: {exc}", file=sys.stderr)
-            return None
+    ok, size = _term_size(args)
+    if not ok:
+        return None
     extra = []
     for option in getattr(args, "ssh_option", None) or []:
         extra += ["-o", option]
@@ -954,8 +975,9 @@ def cmd_connect(args: argparse.Namespace,
         if error:
             print(f"Error: {error}", file=sys.stderr)
             return 1
-        if args.port.startswith("ssh://"):
-            source = _ssh_source(args)
+        if args.port.startswith(("ssh://", "telnet://")):
+            source = (_ssh_source(args) if args.port.startswith("ssh://")
+                      else _telnet_source(args))
             if source is None:
                 return 1
             # A shell or a BBS on the far end reads keys, not lines.
@@ -972,7 +994,7 @@ def cmd_connect(args: argparse.Namespace,
         auto_reconnect=not args.no_reconnect,
         reconnect_interval=args.reconnect_interval,
     )
-    if isinstance(source, (UrlSource, SshSource)):
+    if isinstance(source, (UrlSource, SshSource, TelnetSource)):
         attach_network_note(session, source)
     else:
         attach_exclusivity_report(session, source, requested=not args.no_exclusive)
@@ -1277,6 +1299,50 @@ def cmd_attach(args: argparse.Namespace) -> int:
 # ── remote (socket client) ────────────────────────────────────────────────────
 
 
+def cmd_replay(args: argparse.Namespace) -> int:
+    """Play a recorded session back at its own pace (SPEC S37)."""
+    from .core.recording import load, resolve
+
+    try:
+        recording = load(resolve(args.path, DEFAULT_LOG_ROOT))
+    except (FileNotFoundError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    ok, size = _term_size(args)
+    if not ok:
+        return 1
+    if not recording.has_timing:
+        print(f"Note: no timing file beside {recording.raw_path} — it plays "
+              f"all at once (recorded before timing was kept?)", file=sys.stderr)
+    start_at = 0.0
+    if args.at:
+        from .core.recording import parse_at
+
+        try:
+            start_at = parse_at(args.at, recording)
+        except ValueError as exc:
+            print(f"Error: --at: {exc}", file=sys.stderr)
+            return 1
+        if not 0 <= start_at <= recording.duration:
+            print(f"Error: --at {args.at!r} is outside the recording "
+                  f"(which lasts {recording.duration:.0f} s)", file=sys.stderr)
+            return 1
+    if args.no_tui:
+        from .ui.replay import play_to_stream, stdout_bytes
+
+        try:
+            play_to_stream(recording, stdout_bytes(), speed=args.speed,
+                           max_idle=args.max_idle, start_at=start_at)
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass
+        return 0
+    from .ui.replay import run_replay
+
+    run_replay(recording, speed=args.speed, max_idle=args.max_idle, size=size,
+               start_at=start_at)
+    return 0
+
+
 def cmd_remote(args: argparse.Namespace) -> int:
     source = SocketSource(args.host, args.port, args.auth,
                           replay_lines=getattr(args, "replay_lines", 0))
@@ -1416,8 +1482,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_conn.add_argument("--port", default=None,
                         help="Serial device path or COM port — or a network port: "
                              "socket://HOST:PORT (raw TCP), rfc2217://HOST:PORT "
-                             "(console servers, ser2net, qemu) or "
-                             "ssh://[USER@]HOST[:PORT]. Left out in a "
+                             "(console servers, ser2net, qemu), "
+                             "ssh://[USER@]HOST[:PORT] or telnet://HOST[:PORT]. "
+                             "Left out in a "
                              "terminal, you choose from a list.")
     p_conn.add_argument("--ssh-command", metavar="CMD", default=None,
                         help="With --port ssh://…: run CMD on the far end instead "
@@ -1425,7 +1492,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_conn.add_argument("--ssh-option", action="append", metavar="OPT",
                         help="With --port ssh://…: pass -o OPT to ssh (repeatable).")
     p_conn.add_argument("--term-size", metavar="COLSxROWS", default=None,
-                        help="With --port ssh://…: a fixed window size for the far "
+                        help="With --port ssh:// or telnet://: a fixed window size for the far "
                              "end, e.g. 80x24 for a BBS, or 'auto' (the default): "
                              "follow the terminal view — or, with --no-tui, the "
                              "terminal itself.")
@@ -1640,6 +1707,35 @@ def build_parser() -> argparse.ArgumentParser:
     _add_client_mirror_args(p_att, default_name="<session>-attach")
     _add_common_io_args(p_att)
     p_att.set_defaults(func=cmd_attach)
+
+    # replay
+    p_play = sub.add_parser(
+        "replay", help="Play a recorded session back, at its own pace.",
+        description="Plays output.log back as it arrived (using output-timing.log), "
+                    "through a terminal emulator — so a full-screen program, a "
+                    "BBS or a boot menu reads as it looked. Space pauses, ←/→ "
+                    "seek 5 s, +/- change speed, Home/End jump, g goes to a "
+                    "time, q quits.")
+    p_play.add_argument("path", nargs="?", default=None,
+                        help="A session folder or an output*.log (default: the "
+                             "newest recorded session).")
+    p_play.add_argument("--at", metavar="TIME", default=None,
+                        help="Start here: +00:12:40 (session elapsed, as the "
+                             "timestamped logs show), 03:12:40 (time of day) or "
+                             "'2026-09-30 03:12:40'. Everything before it is "
+                             "drawn at once.")
+    p_play.add_argument("--speed", type=float, default=1.0,
+                        help="Playback speed (default 1; 4 = four times faster).")
+    p_play.add_argument("--max-idle", type=float, default=2.0, metavar="SECONDS",
+                        help="Cut silences longer than this short (default 2; "
+                             "0 = keep them whole).")
+    p_play.add_argument("--term-size", metavar="COLSxROWS", default=None,
+                        help="Draw at a fixed size, e.g. 80x24 for a BBS "
+                             "(default: the window).")
+    p_play.add_argument("--no-tui", action="store_true",
+                        help="Write the bytes to this terminal at their pace "
+                             "instead, and let it draw them (like scriptreplay).")
+    p_play.set_defaults(func=cmd_replay)
 
     # remote
     p_rem = sub.add_parser("remote", help="Attach to a remote uart-proxy server.")

@@ -344,9 +344,7 @@ uart-proxy start   --port rfc2217://console1:7001 --name router
   no busy-port hint, and no following a replug.
 - Mirrors and background sessions are named after the URL
   (`socket-10.0.0.5-4001-0`).
-- Plain `telnet://` (without RFC 2217) isn't supported yet: it needs Telnet
-  option negotiation, and until then a telnet server's control bytes would show
-  up as noise.
+- Plain telnet has its own scheme, `telnet://` — below.
 
 #### Over SSH: `ssh://`
 
@@ -380,6 +378,20 @@ uart-proxy connect --port ssh://bbsu@ptt.cc --term-size 80x24       # a BBS (UTF
   terminal view is how to read it; `output.log` is still the complete record.
 - POSIX only (it needs a pty).
 
+#### Over telnet: `telnet://`
+
+```bash
+uart-proxy connect --port telnet://ptt.cc --term-size 80x24    # a BBS
+uart-proxy connect --port telnet://10.0.0.1                    # a router's CLI
+```
+
+The option negotiation a telnet server starts with is answered, not shown: it
+may echo and suppress go-ahead (character at a time, what a BBS or shell
+expects), gets our terminal type (`XTERM-256COLOR`) and our **window size**
+(NAWS) — which, as with `ssh://`, follows the terminal view unless
+`--term-size` fixes it. Everything else is refused. Like `ssh://`, it starts
+in character mode; the port defaults to 23.
+
 Without hardware at hand, an emulator is a fake device that really boots:
 
 ```bash
@@ -402,6 +414,7 @@ Recording writes three files:
 output.log                 raw RX bytes, exactly as received
 output-timestamp.log       [00:00:10.0000] line          (elapsed only)
 output-fulltimestamp.log   [2026-06-12 08:40:20 | 00:00:10.0000] line
+output-timing.log          when each run of bytes in output.log arrived: epoch, elapsed, bytes (for replay)
 ```
 
 **Where they go:** by default each run gets its own folder so nothing is ever
@@ -439,6 +452,39 @@ At 100 MB all three files move aside together as `output.001.log`,
 each part repeats the banner and names the part before it. `--log-keep-parts`
 deletes the oldest beyond N — retention only prunes *finished* sessions, so this
 is what bounds one that never finishes. Both are off by default.
+
+#### Playing a session back
+
+A full-screen program — a BBS, `vi`, a boot menu — leaves a log of cursor
+movements nobody can read. `replay` plays the recording back through a terminal
+emulator, at the pace it arrived, so it reads as it looked:
+
+```bash
+uart-proxy replay                         # the newest recorded session
+uart-proxy replay ~/.uart-proxy/sessions/20260930-113326 --term-size 80x24
+uart-proxy replay output.003.log --speed 8
+uart-proxy replay DIR --at 03:12:40       # start at that moment
+uart-proxy replay DIR --no-tui            # into this terminal, like scriptreplay
+```
+
+Space pauses, ←/→ seek 5 s, `+`/`-` change speed, Home/End jump, `g` goes to a
+time, `q` quits; the status bar shows the position, the speed and the
+wall-clock time of that moment.
+
+**Debugging with it:** grep the timestamped log for the moment something went
+wrong, then play from just before it —
+
+```bash
+grep -n PANIC ~/.uart-proxy/sessions/20260930-*/output-fulltimestamp.log
+#   …/output-fulltimestamp.log:4812:[2026-09-30 03:12:41 | 00:47:15.2033] PANIC …
+uart-proxy replay ~/.uart-proxy/sessions/20260930-022526 --at 03:12:30
+```
+
+`--at` (and `g`) take `+00:47:15` (session elapsed, as in the timestamped
+logs), `03:12:30` (a time of day) or `2026-09-30 03:12:30`.
+Silences longer than `--max-idle` (2 s) are cut short. It works from
+`output.log` and `output-timing.log`; a recording made before timing was kept
+plays all at once.
 
 #### Retention (auto-cleanup of the session store)
 

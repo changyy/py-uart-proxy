@@ -50,7 +50,7 @@ def test_the_two_schemes_are_accepted():
 
 
 @pytest.mark.parametrize("url, says", [
-    ("telnet://lab:23", "unsupported"),
+    ("ftp://lab:21", "unsupported"),
     ("loop://", "unsupported"),
     ("socket://lab", "needs a host and a port"),
     ("socket://:4001", "needs a host and a port"),
@@ -316,7 +316,7 @@ def test_reading_does_not_resend_the_settings_every_time(rfc2217_server, monkeyp
 
 
 def test_connect_refuses_an_unsupported_url_before_doing_anything(capsys):
-    assert cli.main(["connect", "--port", "telnet://lab:23", "--no-log"]) == 1
+    assert cli.main(["connect", "--port", "ftp://lab:21", "--no-log"]) == 1
     assert "unsupported port URL" in capsys.readouterr().err
 
 

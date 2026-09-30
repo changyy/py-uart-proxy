@@ -17,7 +17,7 @@ The seven original requirements, implemented end to end.
 - ✅ **Mouse follow-tail**: wheel-up pauses auto-scroll to read history, wheel
   back to bottom (or `End`) resumes; status shows follow/paused (SPEC S10).
 - ✅ Tests: engine unit tests, end-to-end proxy over a real socket, and TUI
-  tests via Textual's headless harness (29 tests at v0.1; 393 today).
+  tests via Textual's headless harness (29 tests at v0.1; 577 today).
 - 🟡 Manual hardware validation on macOS + Windows 11.
 
 ## v0.2 — Robustness & UX
@@ -86,7 +86,8 @@ The seven original requirements, implemented end to end.
   - 💡 Offer the terminal view in line mode too (a split, or a toggle
     independent of the input mode) — the emulator already tracks either way.
   - ✅ Tell the far end the window size where the transport can carry it:
-    `ssh://` does (SPEC S35). A remote proxy client could too — still an idea.
+    `ssh://` and `telnet://` do (SPEC S35, S36), and a proxy client passes its
+    own on (SPEC S38).
 - ✅ **`ssh://` ports** (SPEC S35): the system's OpenSSH client in a pty — keys,
   known_hosts and ssh config apply — with the window size passed on, for
   SSH console servers, a UART on another machine, or a BBS.
@@ -98,8 +99,9 @@ The seven original requirements, implemented end to end.
 - ✅ **Network ports** (SPEC S34): `--port socket://HOST:PORT` (raw TCP) and
   `rfc2217://HOST:PORT` (Telnet + COM-port control, settings applied remotely)
   make a console server, ser2net or QEMU port the device.
-- ⬜ **Telnet IAC handling**: minimal negotiation so real telnet/BBS sessions
-  render cleanly (currently raw passthrough).
+- ✅ **Telnet** (SPEC S36): `telnet://HOST[:PORT]` answers option negotiation
+  (ECHO, SGA, BINARY accepted; NAWS and TTYPE offered; the rest refused, never
+  re-confirmed), frames IAC and CR NUL, and sends NAWS on a resize.
 - ✅ **TUI port picker** (SPEC S27): `connect` without `--port` lists the ports
   in a terminal, and lists-and-exits where nobody can answer.
 - ✅ **Scrollback search / filter** (SPEC S28): `Ctrl+] /` shows only matching
@@ -150,7 +152,13 @@ The seven original requirements, implemented end to end.
   live log. Protocol client + screens implemented and tested; platform
   scaffolding still pending. It talks to this app's proxy over the wire contract
   in [PROTOCOL.md](./PROTOCOL.md), so it needs no changes here.
-- ⬜ **Replay mode**: load a recorded `output*.log` and scrub the timeline.
+- ✅ **Replay mode** (SPEC S37): `uart-proxy replay` plays `output.log` back at
+  its recorded pace (from `output-timing.log`) through the terminal emulator,
+  with pause, seek, speed and the wall-clock time; `--at` / `g` go to a moment
+  (elapsed, time of day or date-time); `--no-tui` plays into the terminal like
+  `scriptreplay`. Timing rows carry epoch time, so appended runs replay right.
+  - 💡 Seeking backwards re-feeds from the start (~1 MB/s): fine for hours of a
+    serial console, slow for a very chatty one — keyframes would fix it.
 
 ## Integration: attach to a `uart_helper`-owned port
 

@@ -31,7 +31,7 @@ def test_off_by_default(tmp_path):
         _feed(recorder, f"line {i:05d} " + "x" * 40)
     recorder.close()
     assert _files(tmp_path) == ["output-fulltimestamp.log", "output-timestamp.log",
-                                "output.log"]
+                                "output-timing.log", "output.log"]
 
 
 def test_passing_the_limit_splits_all_three_files_together(tmp_path):
@@ -43,7 +43,8 @@ def test_passing_the_limit_splits_all_three_files_together(tmp_path):
     assert parts, "should have rotated"
     assert parts[0] == [str(tmp_path / "output.001.log"),
                         str(tmp_path / "output-timestamp.001.log"),
-                        str(tmp_path / "output-fulltimestamp.001.log")]
+                        str(tmp_path / "output-fulltimestamp.001.log"),
+                        str(tmp_path / "output-timing.001.log")]
     assert all(os.path.getsize(p) < 3 * 4096 for part in parts for p in part)
 
 
@@ -130,7 +131,8 @@ def test_raw_only_recording_rotates_at_the_limit(tmp_path):
                               data=b"z" * 100))
     parts = list(recorder.parts)
     recorder.close()
-    assert parts and parts[0] == [str(tmp_path / "output.001.log")]
+    assert parts and parts[0] == [str(tmp_path / "output.001.log"),
+                                  str(tmp_path / "output-timing.001.log")]
 
 
 def test_appending_to_a_folder_never_overwrites_an_earlier_runs_parts(tmp_path):

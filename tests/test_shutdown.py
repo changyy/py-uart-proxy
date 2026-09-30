@@ -56,7 +56,7 @@ def test_the_written_files_are_reported(tmp_path):
     recorder = Recorder(str(tmp_path), base_name="output")
     recorder.handle(_rx("hello\n"))
     written = close_recorder(recorder)
-    assert len(written) == 3
+    assert len(written) == 4  # raw, two timestamped, timing
     assert all(os.path.exists(path) for path in written)
 
 
