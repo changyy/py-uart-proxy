@@ -22,7 +22,11 @@ def no_real_hardware(request, monkeypatch):
     from uart_proxy import cli
 
     if "real_ports" not in request.keywords:
+        from uart_proxy.io import uart_source
+
         monkeypatch.setattr(cli, "_scan_ports", lambda: [])
+        # UartSource scans too, to follow an adapter that re-enumerates.
+        monkeypatch.setattr(uart_source, "_scan_ports", lambda: [])
     if "real_daemonize" not in request.keywords:
         def refuse(**kwargs):
             raise AssertionError("an in-process test tried to detach a daemon")

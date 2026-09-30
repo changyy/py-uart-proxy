@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.20260930.1202015] — 2026-09-30
+
+A replugged adapter is followed to its new name, a session that never ends can
+be capped, and a remote port can be opened as a local PTY.
+
+### Added
+- **A replugged adapter is followed to its new name** (SPEC S31):
+  `usbserial-110` coming back as `usbserial-120` is recognised by VID/PID and
+  serial number (or, without one, its USB socket) and reconnected, with a
+  notice; the session registry follows too. Never a guess between identical
+  adapters; ports without USB identity keep path-only reconnect.
+- **Log parts** (SPEC S32): `--log-rotate-mb N` splits the three log files
+  together into `output.001.log`, … at a line end, each part with its own
+  banner; `--log-keep-parts K` deletes the oldest. Off by default.
+- **PTY mirrors for `remote` and `attach`** (SPEC S33): `--proxy-dir` turns a
+  remote stream into local PTYs (`<host>-<port>-0`, `<session>-attach-0`).
+  Writes through a read-only code are refused, and said so.
+- **SSH tunnel guide** in the README: loopback-only serving, `-L`, `-R` for a
+  lab behind NAT, `-J`, and `autossh`.
+
+### Changed
+- `ports`, and the port picker, list USB adapters first, and no longer print
+  pyserial's `"n/a"` placeholder as a description (`ports --json` gives `""`).
+  Nothing is hidden: a built-in UART has no USB identity either.
+
 ## [1.20260930.1193756] — 2026-09-30
 
 The proxy became safe to leave on a network, and the TUI learned to find

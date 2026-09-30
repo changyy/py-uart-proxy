@@ -45,6 +45,7 @@ from .core.daemon import (
 )
 from .core.events import EventKind
 from .core.port_busy import describe_busy, same_device
+from .core.port_identity import clean_description, describe as describe_port, sort_ports
 from .core.pty_proxy import (
     DEFAULT_MAX_LAG,
     DEFAULT_PROXY_COUNT,
@@ -93,12 +94,8 @@ def port_choices(scan: Optional[Callable[[], list]] = None) -> list:
     except OSError:
         held = []
     choices = []
-    for ident in scan():
-        parts = []
-        if ident.vid is not None:
-            parts.append(ident.vid_pid_str)
-        if ident.description:
-            parts.append(f'"{ident.description}"')
+    for ident in sort_ports(scan()):
+        parts = [describe_port(ident)] if describe_port(ident) else []
         holder = next((d for d in held if same_device(d.port, ident.tty_device)), None)
         if holder is not None:
             parts.append(f"(held by '{holder.name}' — attach instead)")
@@ -164,14 +161,15 @@ def resolve_port(args: argparse.Namespace,
 
 
 def cmd_ports(args: argparse.Namespace) -> int:
-    monitor = SerialMonitor()
-    found = monitor.scan_once()
+    # USB adapters first; ports with no USB identity (built-in UARTs, macOS's
+    # virtual nodes) after them — listed, since some of them are real UARTs.
+    found = [(ident, None) for ident in sort_ports(_scan_ports())]
     if args.json:
         data = [
             {
                 "device": ident.tty_device,
                 "raw_device": ident.device,
-                "description": ident.description,
+                "description": clean_description(ident.description),
                 "vid_pid": ident.vid_pid_str,
                 "serial": ident.serial_number,
                 "manufacturer": ident.manufacturer,
@@ -186,14 +184,8 @@ def cmd_ports(args: argparse.Namespace) -> int:
         return 0
     print(f"Found {len(found)} port(s):\n")
     for ident, _ in found:
-        line = f"  {ident.tty_device}"
-        if ident.vid is not None:
-            line += f"  {ident.vid_pid_str}"
-        if ident.description:
-            line += f'  "{ident.description}"'
-        if ident.serial_number:
-            line += f"  serial={ident.serial_number}"
-        print(line)
+        details = describe_port(ident)
+        print(f"  {ident.tty_device}  {details}".rstrip())
     return 0
 
 
@@ -419,9 +411,10 @@ def _attach_recorder(session: UartSession, args: argparse.Namespace) -> Optional
         base_name=args.log_base,
         include_tx=args.log_tx,
         append=args.log_append,
+        rotate_bytes=int(getattr(args, "log_rotate_mb", 0) * 1024 * 1024),
+        keep_parts=getattr(args, "log_keep_parts", 0),
     )
-    for line in session_header(session, args):
-        recorder.mark(line)
+    recorder.set_banner(session_header(session, args))
     session.bus.subscribe(recorder.handle)
     return recorder
 
@@ -581,6 +574,31 @@ def attach_busy_report(
     session.bus.subscribe(on_event)
 
 
+def attach_move_report(session: UartSession, source: UartSource) -> None:
+    """Say so when the adapter came back under another name (SPEC S31).
+
+    And keep the registry honest: a session of ours (background, or a
+    foreground ``--serve``) is recorded under the port it holds, which
+    ``status``, the busy hint and ``start``'s refusal all go by.
+    """
+    def on_moved(old: str, new: str) -> None:
+        who = describe_port(source.identity) if source.identity is not None else ""
+        session.publish_notice(
+            f"device moved: {old} → {new} — the same adapter ({who}), "
+            f"re-enumerated after a replug; following it")
+        if not DAEMON_SUPPORTED:
+            return
+        try:
+            for info in list_daemons():
+                if info.pid == os.getpid():
+                    info.port = new
+                    info.write()
+        except OSError as exc:
+            session.publish_notice(f"could not update the session registry: {exc}")
+
+    source.on_moved = on_moved
+
+
 def _maybe_build_pty_proxy(
     session: UartSession, args: argparse.Namespace
 ) -> Optional[PtyProxyGroup]:
@@ -603,7 +621,8 @@ def _maybe_build_pty_proxy(
     # A named session names its mirrors too: `--name router` should give you
     # router-0/router-1, one handle for the whole thing. Unnamed (plain
     # `connect`) falls back to the device stem, as before.
-    stem = getattr(args, "name", None) or device_stem(getattr(args, "port", "") or "uart")
+    stem = (getattr(args, "mirror_stem", None) or getattr(args, "name", None)
+            or device_stem(str(getattr(args, "port", "") or "uart")))
     links = build_links(
         proxy_dir or DEFAULT_PROXY_DIR,
         stem,
@@ -639,7 +658,7 @@ def close_recorder(recorder: Recorder) -> list[str]:
     yields an empty list, which is how the "Logs written:" summary managed to be
     dead code from the start.
     """
-    paths = list(recorder.paths)
+    paths = [path for part in recorder.parts for path in part] + list(recorder.paths)
     recorder.close()
     return paths
 
@@ -800,7 +819,7 @@ def _run_session(
     if mirrors is not None:
         session.bus.subscribe(mirrors.handle)
         mirrors.start()
-        _report_mirrors(mirrors, getattr(args, "port", "the session"))
+        _report_mirrors(mirrors, session.source.description())
 
     # A plain SIGTERM (not just Ctrl-C) has to reach the cleanup in `finally`
     # rather than killing us outright — mirror symlinks are the most visible
@@ -890,6 +909,7 @@ def cmd_connect(args: argparse.Namespace,
     )
     attach_exclusivity_report(session, source, requested=not args.no_exclusive)
     attach_busy_report(session, source)
+    attach_move_report(session, source)
     return _run_session(session, args, title=f"uart-proxy · {args.port}",
                         on_ready=on_ready)
 
@@ -1174,6 +1194,9 @@ def cmd_attach(args: argparse.Namespace) -> int:
     _adopt_remote_timeline(session, source)
     source.on_tx_echo = session.publish_remote_tx
     args.serve = False
+    if not args.mirror_stem:
+        # Not `<name>-0`: those are the daemon's own mirrors, maybe in the same dir.
+        args.mirror_stem = f"{info.name}-attach"
     # The daemon is already recording this session; a second copy under the
     # client would only duplicate it.
     args.no_log = True
@@ -1205,12 +1228,38 @@ def cmd_remote(args: argparse.Namespace) -> int:
     _adopt_remote_timeline(session, source)
     source.on_tx_echo = session.publish_remote_tx
     args.serve = False
+    if not args.mirror_stem:
+        args.mirror_stem = f"{args.host}-{args.port}".replace(":", "_").replace("/", "_")
     return _run_session(session, args,
                         title=f"uart-proxy · {args.host}:{args.port}",
                         history=lambda: source.replay)
 
 
 # ── argument parsing ──────────────────────────────────────────────────────────
+
+
+def _add_client_mirror_args(p: argparse.ArgumentParser, *, default_name: str) -> None:
+    """PTY mirrors for a client (``remote``, ``attach``) — SPEC S33.
+
+    The same mirrors ``connect`` offers, fed from the stream we are a client
+    of: a remote port becomes a local PTY that ``screen`` or a script can open
+    as though the device were plugged in here.
+    """
+    p.add_argument("--proxy-dir", nargs="?", const=DEFAULT_PROXY_DIR, default=None,
+                   metavar="DIR",
+                   help=f"Expose the stream as local read/write PTY mirrors, "
+                        f"symlinked into DIR (default {DEFAULT_PROXY_DIR}), named "
+                        f"{default_name}-0, -1…")
+    p.add_argument("--proxy-count", type=int, default=DEFAULT_PROXY_COUNT, metavar="N",
+                   help=f"How many mirrors (default {DEFAULT_PROXY_COUNT}).")
+    p.add_argument("--proxy", action="append", metavar="PATH",
+                   help="Expose a mirror at exactly PATH (repeatable).")
+    p.add_argument("--tx-merge", choices=list(TX_MERGE_MODES), default=DEFAULT_TX_MERGE,
+                   help="How mirror writers reach the wire (see 'connect --help').")
+    p.add_argument("--proxy-max-lag", type=float, default=DEFAULT_MAX_LAG,
+                   metavar="SECONDS", help=argparse.SUPPRESS)
+    p.add_argument("--mirror-name", dest="mirror_stem", default=None, metavar="NAME",
+                   help=f"Name the mirrors NAME-0, NAME-1… (default {default_name}).")
 
 
 def _add_common_io_args(p: argparse.ArgumentParser) -> None:
@@ -1239,6 +1288,13 @@ def _add_common_io_args(p: argparse.ArgumentParser) -> None:
                    help="Also record TX lines in the timestamped logs.")
     p.add_argument("--log-append", action="store_true",
                    help="Append to existing log files instead of overwriting.")
+    p.add_argument("--log-rotate-mb", type=float, default=0, metavar="MB",
+                   help="Split the logs into parts (output.001.log, …) once a "
+                        "file passes MB. 0 = never (default).")
+    p.add_argument("--log-keep-parts", type=int, default=0, metavar="N",
+                   help="With --log-rotate-mb, delete the oldest parts beyond N "
+                        "— this is what caps a session that never ends. "
+                        "0 = keep all (default).")
     # retention (only applies to the default ~/.uart-proxy/sessions store)
     p.add_argument("--max-age-days", type=float, default=None,
                    help=f"Delete sessions older than N days "
@@ -1489,6 +1545,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Start in line mode (type a command, press Enter) or "
                             "character mode (every keystroke goes straight to the "
                             "device, so ^C and tab completion work).")
+    _add_client_mirror_args(p_att, default_name="<session>-attach")
     _add_common_io_args(p_att)
     p_att.set_defaults(func=cmd_attach)
 
@@ -1508,6 +1565,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Start in line mode (type a command, press Enter) or "
                             "character mode (every keystroke goes straight to the "
                             "device, so ^C and tab completion work).")
+    _add_client_mirror_args(p_rem, default_name="<host>-<port>")
     _add_common_io_args(p_rem)
     p_rem.set_defaults(func=cmd_remote)
 

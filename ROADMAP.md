@@ -25,14 +25,14 @@ The seven original requirements, implemented end to end.
 - ✅ **Session retention**: auto-prune `~/.uart-proxy/sessions/` by age
   (30 days) and total size (500 MB, delete oldest); configurable via CLI or
   `~/.uart-proxy/config.toml`; `uart-proxy sessions [--prune]` (SPEC S11).
-- 💡 Per-file rotation *within* a single very long session (split `output.log`
-  at N MB) — currently retention is per-session-folder only; mid-session size
-  is not capped while a run is active.
+- ✅ **Rotation within a session** (SPEC S32): `--log-rotate-mb` splits the
+  three files together into numbered parts at a line end; `--log-keep-parts`
+  deletes the oldest, which is what caps a session that never finishes.
 
 - ✅ **Reconnect / hot-plug**: `connect` waits for an absent device and
   auto-reattaches on drop/return (`--no-reconnect`, `--reconnect-interval`;
-  SPEC S12). Still polling-based on the same path; matching a re-enumerated
-  path (e.g. usbserial-110→120) via `SerialMonitor` is a future refinement.
+  SPEC S12). Still polling-based; an adapter re-enumerated under a new path
+  (usbserial-110→120) is followed by VID/PID/serial (SPEC S31).
 - ✅ **Selection & clipboard** in the TUI (drag-select + Cmd/Ctrl+C; SPEC S13).
 - ✅ **Exclusive claim on the port** (SPEC S15): `connect` now takes `TIOCEXCL`
   so no other program can open the same wire behind our back (pyserial's
@@ -45,8 +45,8 @@ The seven original requirements, implemented end to end.
   port while uart-proxy keeps it. RX broadcast; TX **raw by default** so `^C`,
   tab completion and arrow keys behave, with `--tx-merge line` as the opt-in that
   keeps concurrent commands atomic instead. POSIX only.
-  - 💡 Extend it to `remote` too (mirror a *remote* stream locally) — the sink is
-    already source-agnostic; only the `remote` subparser lacks the flags.
+  - ✅ `remote` and `attach` take the mirror flags too (SPEC S33): a remote
+    port as a local PTY.
 - ✅ **Background sessions** (SPEC S17): `start` detaches (double fork + setsid),
   `status` lists what's running with time-since-last-output, `stop` shuts down in
   order. One `0600` JSON state file per session under `~/.uart-proxy/daemons/` is
@@ -108,8 +108,9 @@ The seven original requirements, implemented end to end.
 
 ## v0.3 — Security & packaging
 
-- ⬜ **TLS for the proxy** (or an SSH-tunnel doc) — auth code alone is plaintext
-  today; fine on a trusted LAN, not the open internet.
+- 🟡 **TLS for the proxy** — still plaintext on the wire. The SSH-tunnel guide
+  is written (README §5: `-L`, `-R` for a lab behind NAT, `-J`, autossh); TLS
+  itself remains.
 - ⬜ **Per-role command allow-list** (e.g. a role that may only send specific
   commands).
 - ✅ **Auth rate limit** (SPEC S22): 10 failed attempts from one address within

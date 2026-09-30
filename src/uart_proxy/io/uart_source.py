@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import logging
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 from uart_helper import PortIdentity, UARTConfig, UARTDevice
 
-from ..core.port_busy import is_busy_error
+from ..core.port_busy import is_busy_error, same_device
+from ..core.port_identity import find_moved, has_usb_identity
 from .source import DataSource
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,12 @@ def seize_exclusive(fd: int) -> bool:
     return True
 
 
+def _scan_ports() -> list:
+    from uart_helper import SerialMonitor
+
+    return [ident for ident, _ in SerialMonitor().scan_once()]
+
+
 class UartSource(DataSource):
     def __init__(
         self,
@@ -73,6 +80,7 @@ class UartSource(DataSource):
         config: Optional[UARTConfig] = None,
         *,
         exclusive: bool = True,
+        scan: Optional[Callable[[], list]] = None,
     ) -> None:
         # PortIdentity.tty_device maps /dev/cu.* -> /dev/tty.* on macOS and is a
         # no-op elsewhere.
@@ -85,14 +93,25 @@ class UartSource(DataSource):
         #: Whether the last open() failed because another process holds the
         #: port (SPEC S21), as opposed to it being absent or not permitted.
         self.busy = False
+        # Following an adapter that re-enumerates under a new name (SPEC S31):
+        # who it is, learnt at the first successful open, and how to look.
+        self._scan = scan or _scan_ports
+        self.identity = None
+        #: Called with (old_path, new_path) when the adapter is found elsewhere.
+        self.on_moved: Optional[Callable[[str, str], None]] = None
 
     def open(self) -> None:
         try:
             self._dev.open()
         except Exception as exc:
             self.busy = is_busy_error(exc)
-            raise
+            # Gone from its path — but maybe back under another name.
+            if self.busy or not self._follow():
+                raise
+            self._dev.open()   # the new path; failing here is an ordinary failure
         self.busy = False
+        if self.identity is None:
+            self.identity = self._identify(self._device_path)
         self.is_exclusive = False
         if self._exclusive:
             fd = self._fileno()
@@ -126,6 +145,37 @@ class UartSource(DataSource):
     @property
     def device_path(self) -> str:
         return self._device_path
+
+    def _identify(self, path: str):
+        """This port's USB identity, from a scan, or None if it has none."""
+        try:
+            for ident in self._scan():
+                if same_device(ident.tty_device, path):
+                    return ident if has_usb_identity(ident) else None
+        except Exception:  # noqa: BLE001 - identity is a bonus, never a failure
+            logger.debug("port scan failed", exc_info=True)
+        return None
+
+    def _follow(self) -> bool:
+        """Switch to where the adapter is now, if it moved. True if switched."""
+        if self.identity is None:
+            return False
+        try:
+            candidates = self._scan()
+        except Exception:  # noqa: BLE001
+            return False
+        new_path, why = find_moved(self.identity, candidates)
+        if new_path is None or same_device(new_path, self._device_path):
+            if why:
+                logger.debug("not following %s: %s", self._device_path, why)
+            return False
+        old_path = self._device_path
+        self._device_path = PortIdentity(device=new_path).tty_device
+        self._dev = UARTDevice(PortIdentity(device=self._device_path), self._config)
+        logger.info("%s re-enumerated as %s", old_path, self._device_path)
+        if self.on_moved is not None:
+            self.on_moved(old_path, self._device_path)
+        return True
 
     def _fileno(self) -> Optional[int]:
         """The open port's file descriptor, or None if we can't reach it.

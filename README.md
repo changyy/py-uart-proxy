@@ -243,6 +243,13 @@ the device appears**. If the device is unplugged mid-session it shows
 `reconnecting` and re-attaches when it returns. Disable with `--no-reconnect`;
 tune the retry period with `--reconnect-interval SECONDS`.
 
+A USB adapter replugged can come back under **another name**
+(`usbserial-110` → `usbserial-120`). `connect` recognises it by its identity —
+VID, PID and serial number, or failing a serial the USB socket it is in — and
+follows it, with a notice saying where it went. It never guesses between two
+identical adapters it can't tell apart, and a port with no USB identity (a
+built-in UART) is waited for on its own path as before.
+
 ### Baud rate
 
 `--baud` defaults to **115200**, so it is optional. The effective baud (and
@@ -340,6 +347,18 @@ The path is printed at startup and shown live in the TUI status bar
 current directory), rename the files with `--log-base NAME`, disable with
 `--no-log`, or append instead of overwrite with `--log-append`.
 
+A session left running for days can be split into parts, and capped:
+
+```bash
+uart-proxy start --port … --log-rotate-mb 100 --log-keep-parts 20   # ≤ ~2 GB
+```
+
+At 100 MB all three files move aside together as `output.001.log`,
+`output-timestamp.001.log`, … and fresh ones continue, at the end of a line;
+each part repeats the banner and names the part before it. `--log-keep-parts`
+deletes the oldest beyond N — retention only prunes *finished* sessions, so this
+is what bounds one that never finishes. Both are off by default.
+
 #### Retention (auto-cleanup of the session store)
 
 The default store is pruned automatically on each run along two axes:
@@ -428,9 +447,77 @@ rather than retrying, so a server restarted with a new code can't get its old
 clients banned. Guessing is rate-limited per address: **10 failed attempts within a minute** and
 that address is refused for **10 minutes** (with a notice in the session), even
 with the right code. Other addresses are unaffected, and it clears on its own —
-no restart needed. The code travels in plain text, so on a network you don't
-trust, tunnel it (e.g. `ssh -L 9600:127.0.0.1:9600 host`) and listen on
-loopback.
+no restart needed. The code travels in plain text — see below for networks you
+don't trust.
+
+#### Over a network you don't trust: an SSH tunnel
+
+**Why.** The proxy has no TLS yet: the auth code and every byte of the console —
+including passwords you type — cross the network in the clear. Fine on a LAN you
+trust; not across an office network, public Wi-Fi or the internet.
+
+**How.** Nothing in uart-proxy changes. You make it listen on **loopback only**,
+so nothing outside that machine can reach it, and let SSH — which you already
+trust for logging in — carry the connection, encrypted and authenticated:
+
+```
+your machine                                lab machine (UART attached)
+────────────                                ───────────────────────────
+uart-proxy remote                           uart-proxy, listening on 127.0.0.1:9600
+  │ connects to 127.0.0.1:9600                          ▲
+  ▼                                                     │
+ssh client ═════ encrypted SSH connection (port 22) ══▶ sshd
+                 (anyone in between sees only SSH)
+```
+
+**1. On the lab machine** — serve on loopback, and get the code:
+
+```bash
+uart-proxy start --port /dev/ttyUSB0     # background; loopback is its default
+# or in a terminal (connect --serve defaults to every interface, so say so):
+uart-proxy connect --port /dev/ttyUSB0 --serve --listen 127.0.0.1
+
+uart-proxy status --show-auth            # the auth code for step 2
+```
+
+**2. On your machine** — open the tunnel, then connect to your *own* loopback:
+
+```bash
+ssh -N -L 9600:127.0.0.1:9600 you@lab    # leave it running (or add &)
+uart-proxy remote --host 127.0.0.1 --port 9600 --auth <code>
+```
+
+`-L 9600:127.0.0.1:9600` reads "my port 9600 → what `lab` sees as
+`127.0.0.1:9600`"; `-N` opens the tunnel without a remote shell. `remote`
+talks to `127.0.0.1` on *your* machine, and SSH delivers it to the lab.
+
+**Other setups**
+
+| Situation | Command |
+|---|---|
+| Port 9600 is already taken on your machine | `ssh -N -L 19600:127.0.0.1:9600 you@lab`, then `remote --port 19600` |
+| The lab is behind NAT and can't be reached, but can reach you | on the **lab**: `ssh -N -R 9600:127.0.0.1:9600 you@your-machine`; connect to `127.0.0.1:9600` on yours |
+| Only reachable through a jump host | `ssh -N -J you@bastion -L 9600:127.0.0.1:9600 you@lab` |
+
+**Leaving it running**
+
+- If the network drops, the tunnel drops; `remote` keeps retrying and picks up
+  again when the tunnel is back. Only a *refused* code makes it stop.
+- To rebuild the tunnel itself automatically, use `autossh`:
+  `autossh -M 0 -N -o ServerAliveInterval=15 -L 9600:127.0.0.1:9600 you@lab`
+- Local tools can ride the same tunnel: add `--proxy-dir` to `remote`, and
+  `screen /tmp/uart-proxy/127.0.0.1-9600-0` talks to the lab's device as if it
+  were plugged in here.
+
+**Pitfalls**
+
+- **Loopback only, or the tunnel protects nothing.** `connect --serve` listens
+  on `0.0.0.0` unless told otherwise, and then anyone can skip the tunnel and
+  connect to `lab:9600` directly. **Check** from another machine: connecting to
+  `lab:9600` should fail.
+- **Everyone through the tunnel is `127.0.0.1`** to the rate limit, so one
+  person guessing a code wrong refuses all tunnelled clients for 10 minutes.
+  Copy the code from `status --show-auth` rather than typing it from memory.
 
 #### Attaching to a `uart_helper`-owned port (integration apps)
 
@@ -611,6 +698,12 @@ $ python examples/check_pty_mirrors.py
 > per-client request/response, use the socket proxy protocol instead.
 >
 > POSIX only — Windows has no `pty`. Use `--serve` there.
+
+A **remote** stream can be mirrored the same way — `remote … --proxy-dir` (and
+`attach … --proxy-dir`) gives local PTYs fed from a proxy elsewhere, named
+`<host>-<port>-0` (`<session>-attach-0` for `attach`, so they never collide with
+the daemon's own). With a read-only code, what is typed into them is refused,
+and said so.
 
 ### 7. Run it in the background (`start` / `status` / `stop`)
 

@@ -988,3 +988,76 @@ than asks.
 unless a test is marked `real_ports` / `real_daemonize`). A test that scanned,
 found a developer's plugged-in adapter matching its profile, and detached a
 daemon onto it is why.
+
+## S31. Following an adapter that re-enumerated
+
+- A USB adapter replugged may return under another path (`usbserial-110` →
+  `usbserial-120`); path-only reconnect (S12) would wait for the old node
+  forever. `UartSource` learns the port's **identity** from a scan at its first
+  successful open, and when a later open fails for any reason but busy (S21),
+  scans for it:
+  1. VID + PID + serial number, when the adapter has one;
+  2. otherwise VID + PID + description, narrowed to the same USB location
+     (physical socket) when that separates candidates.
+  Exactly one match → switch to it (new `UARTDevice`, same config), call
+  `on_moved(old, new)`, and open there. None → the open fails as before.
+  Several → never a guess: connecting to the wrong device is worse than
+  waiting.
+- A port first seen without USB identity (`/dev/ttyS0`, macOS's
+  `Bluetooth-Incoming-Port`) is never followed.
+- `connect` announces the move as a NOTICE naming the adapter, and rewrites the
+  `port` of any registry entry this process owns (S17/S23), which `status`, the
+  busy hint and `start`'s refusal all use.
+- **Listing:** `ports` and the picker sort USB adapters first and drop
+  pyserial's `n/a` placeholder; nothing is filtered, since built-in UARTs have
+  no VID either.
+
+**Acceptance**: the placeholder is not a description; description shows only
+what is known; adapters sort first and nothing is hidden, in `ports`, `--json`
+and the picker. A serial finds the adapter under a new name; a different serial
+does not; without a serial one of the model suffices, two are never guessed
+between, and a matching USB socket separates them; no USB identity, no
+following. `UartSource` learns identity on first open, follows a replug, fails
+plainly while unplugged, never treats busy as moved, never follows a non-USB
+port, and survives a failing scan; a reconnecting session ends up on the new
+path with a notice; only this process's registry entry is rewritten.
+
+## S32. Log parts
+
+- `Recorder(rotate_bytes=N)` (`--log-rotate-mb`): once the raw file or the
+  larger timestamped file passes N bytes, all three are closed together at the
+  **end of the next line**, renamed `<base>.NNN.log`, `<base>-timestamp.NNN.log`,
+  `<base>-fulltimestamp.NNN.log`, and reopened empty. A stream with no newlines
+  rotates anyway past 2N; with no text files, at N.
+- The old part ends `# continues in part K+1`; the new one repeats the banner
+  (S25) and says which file came before. The raw files never get a mark.
+- Numbering continues past parts already in the folder (`--log-append`), never
+  overwriting one.
+- `keep_parts=K` (`--log-keep-parts`) deletes the oldest beyond K — the only
+  thing that bounds a session which never ends, since retention (S11) prunes
+  finished session folders. "Logs written" lists every part.
+
+**Acceptance**: off by default; the limit splits all three together; raw is
+byte-exact and lines whole and ordered across parts; each part reads on its
+own; raw never gets a banner; `keep_parts` removes the oldest; a line longer
+than the limit is not split; binary and raw-only recordings rotate; appending
+never overwrites an earlier run's parts; `close_recorder` lists every part; a
+real `connect --log-rotate-mb 0.01 --log-keep-parts 2` produces part 3 and has
+deleted part 1.
+
+## S33. PTY mirrors for clients
+
+- `remote` and `attach` take `--proxy-dir`, `--proxy-count`, `--proxy`,
+  `--tx-merge` and `--mirror-name`: the S14 mirrors, fed from the stream we are
+  a client of, so a remote port can be opened locally as a PTY.
+- Default names: `<host>-<port>-N` for `remote`; `<session>-attach-N` for
+  `attach`, so they never collide with the daemon's own `<session>-N` in the
+  same directory.
+- Writes go through the client session to the server. With a read-only code
+  they are refused, and the refusal is a NOTICE (headless mode prints it), not
+  silence.
+
+**Acceptance**: both commands parse the flags; off unless asked; a stem names
+the links; a real `remote --proxy-dir` against an in-process server carries RX
+to the mirror and mirror input to the far device, and removes its link on exit;
+with a read-only code the device receives nothing and the refusal is printed.
