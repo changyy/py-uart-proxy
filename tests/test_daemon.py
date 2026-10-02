@@ -56,6 +56,7 @@ def test_state_survives_a_round_trip():
     assert loaded == original
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file modes; Windows relies on the profile (S39)")
 def test_the_state_file_is_private_because_it_holds_the_auth_code():
     info = _info()
     info.write()

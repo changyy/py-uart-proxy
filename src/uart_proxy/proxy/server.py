@@ -47,6 +47,9 @@ _SEND_QUEUE_MAX = 10000    # per-client backlog before we drop the slowest clien
 #: that never send `auth` could hold every slot for their 10 s grace each.
 MAX_CLIENTS = 16
 
+#: How long a client's own name (``auth.client``, SPEC S40) may be.
+CLIENT_NAME_MAX = 64
+
 MAX_AUTH_FAILURES = 10
 FAIL_WINDOW = 60.0
 BAN_SECONDS = 600.0
@@ -109,6 +112,9 @@ class _Client:
         self.conn = conn
         self.addr = addr
         self.role: Optional[Role] = None
+        #: The name the client gave itself (``auth.client``), if any (S40).
+        self.name = ""
+        self.connected_at = time.time()
         self.send_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=_SEND_QUEUE_MAX)
         self._recv_buf = bytearray()
         self.writer_thread: Optional[threading.Thread] = None
@@ -250,6 +256,20 @@ class ProxyServer:
         with self._clients_lock:
             return len(self._clients)
 
+    def clients(self) -> list[dict]:
+        """The authenticated connections, oldest first (SPEC S40)."""
+        with self._clients_lock:
+            clients = sorted(self._clients, key=lambda c: c.connected_at)
+        return [{"address": self._endpoint(c), "role": c.role.value if c.role else "",
+                 "client": c.name, "connected_at": c.connected_at} for c in clients]
+
+    @staticmethod
+    def _endpoint(client: "_Client") -> str:
+        addr = client.addr
+        if isinstance(addr, tuple) and len(addr) >= 2:
+            return f"{addr[0]}:{addr[1]}"
+        return str(addr)
+
     # ── accept / auth ────────────────────────────────────────────────────────
 
     def _accept_loop(self) -> None:
@@ -360,6 +380,7 @@ class ProxyServer:
                 return self._reject(client, "invalid code")
             self.limiter.record_success(self._address(client))
             client.role = role
+            client.name = str(msg.get("client") or "")[:CLIENT_NAME_MAX]
             self._send_now(
                 client,
                 {
@@ -470,7 +491,10 @@ class ProxyServer:
         # The TX line event fires synchronously inside write(), on this thread.
         self._origin.client = client
         try:
-            self.session.write(data)
+            self.session.write(data, origin={
+                "via": "proxy", "role": client.role.value,
+                "client": client.name, "address": self._endpoint(client),
+            })
         except Exception as exc:  # noqa: BLE001
             client.enqueue(encode_message({"type": "notice", "text": f"write failed: {exc}"}))
         finally:

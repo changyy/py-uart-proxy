@@ -27,6 +27,7 @@ Client's first line MUST be an auth request:
 ```json
 {"type": "auth", "code": "123456"}
 {"type": "auth", "code": "123456", "replay": 2000}
+{"type": "auth", "code": "123456", "replay": 500, "client": "uart-proxy mcp (claude-ai)"}
 ```
 
 Server replies with exactly one of:
@@ -48,6 +49,10 @@ counts towards that refusal.
 
 - `replay` (optional, client) — ask for up to N lines of recent history before the
   live stream starts. Omit it, or send `0`, for live only.
+- `client` (optional, client) — a name for this client, at most 64 characters,
+  e.g. `uart-proxy mcp (claude-ai)`. The server shows it to whoever owns the
+  session and puts it on what the client writes (SPEC S40). Omit it to stay
+  unnamed.
 - `replay_available` (optional, server) — how many lines the server *could* have
   offered. Informational.
 - `elapsed` (optional, server) — where the server's session is on its own clock,

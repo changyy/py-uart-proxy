@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+Scripts and AI agents can now drive a session somebody shares — and the person
+sharing it still sees everything.
+
+### Added
+- **`uart-proxy mcp`** (SPEC S42): a Model Context Protocol server on stdio for
+  AI tools. `list_sessions`, `session_status`, `tail`, `read_new` and
+  `wait_for` read a served session; `send_text` / `send_hex` type into it, only
+  with `--allow-send` and only with a full-access code. It is a client of the
+  session, never the port's owner, results are bounded, and it is standard
+  library only.
+- **`uart-proxy tail` / `expect` / `send`** and **`uart_proxy.client.SessionClient`**
+  (SPEC S41): a served session from a shell, a test or Python — stamped lines,
+  a cursor that misses nothing, waiting for a pattern (prompts without a
+  newline included), sending text or hex.
+- **Who sent it** (SPEC S40): TX events carry `meta["origin"]` when a proxy
+  client wrote them; clients may name themselves (`auth.client`, an optional
+  protocol field); `ProxyServer.clients()` lists the connections.
+- **The session registry on Windows** (SPEC S39): a foreground `connect
+  --serve` — or an application serving a session (`register_served`) —
+  registers on every OS, with an `owner` and a `title`. Liveness on Windows
+  asks the OS for the process instead of `os.kill(pid, 0)`, which there would
+  have sent Ctrl-C.
+
 ## [1.20260930.1205413] — 2026-09-30
 
 Telnet joins the network ports, and a session can be watched again as it

@@ -145,6 +145,24 @@ rewrites a `/dev/cu.*` argument, so `--port /dev/cu.usbserial-110` really opens
 `/dev/tty.usbserial-110` — the banner prints the path actually used. With the
 claim taken, both nodes of the pair return `EBUSY` to everyone else.
 
+## Clients for scripts and AI agents (SPEC S39–S42)
+
+```
+  owner of the port (connect --serve · start · an app's shared tab)
+        │ ProxyServer — registered in ~/.uart-proxy/daemons/<name>.json
+        ▼ JSON-lines, readonly or full code
+  SessionClient ── stamped lines, cursor, expect, send
+        ├── uart-proxy tail / expect / send     (a shell, CI)
+        └── uart-proxy mcp  ── stdio JSON-RPC ──► an AI tool (MCP client)
+```
+
+The MCP server and the CLI are clients like `attach`: they never open the
+port, so the owner keeps seeing every line sent and every reply. A client may
+name itself (`auth.client`); what a proxy client writes carries
+`meta["origin"]` on its TX events, so an owner can tell the agent's lines from
+its own. The registry works on every OS: on Windows its liveness probe asks for
+a process handle, because `os.kill(pid, 0)` there sends Ctrl-C.
+
 ## Proxy protocol (summary)
 
 One JSON object per line, UTF-8, `\n`-terminated. Full spec in

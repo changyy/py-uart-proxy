@@ -19,7 +19,9 @@ crashed daemon leaves exactly one stale file, which the next command prunes.
 (``/dev/cu.usbserial-110`` → ``usbserial-110``), so one daemon per adapter reads
 naturally and two adapters can run side by side.
 
-POSIX only: detaching needs ``fork`` + ``setsid``.
+Detaching needs ``fork`` + ``setsid``, so ``start`` is POSIX only; the registry
+itself works on every OS (SPEC S39) — a foreground ``connect --serve``, or an
+application serving a session, registers there on Windows too.
 """
 
 from __future__ import annotations
@@ -92,6 +94,10 @@ class DaemonInfo:
     #: A ``connect --serve`` in a terminal rather than a detached ``start``
     #: (SPEC S23): registered so ``status`` / ``attach`` can find it too.
     foreground: bool = False
+    #: Who serves it (SPEC S39): ``uart-proxy``, or an embedding application.
+    owner: str = "uart-proxy"
+    #: What to call it, for a list a person reads (e.g. an app's tab title).
+    title: str = ""
 
     # ── persistence ────────────────────────────────────────────────────────
 
@@ -106,7 +112,12 @@ class DaemonInfo:
         tmp = f"{self.path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(asdict(self), fh, indent=2, sort_keys=True)
-        os.chmod(tmp, 0o600)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            if sys.platform != "win32":
+                raise
+            # Windows: the profile's permissions keep other users out (S39).
         os.replace(tmp, self.path)
 
     def remove(self) -> None:
@@ -129,6 +140,8 @@ class DaemonInfo:
         """
         if self.pid <= 0:
             return False
+        if sys.platform == "win32":
+            return _windows_pid_alive(self.pid)
         try:
             os.kill(self.pid, 0)
         except ProcessLookupError:
@@ -163,6 +176,79 @@ class DaemonInfo:
     def from_dict(cls, data: dict) -> "DaemonInfo":
         known = {f for f in cls.__dataclass_fields__}  # tolerate older/newer files
         return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def _kernel32():
+    import ctypes
+
+    return ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259
+_ERROR_ACCESS_DENIED = 5
+
+
+def _windows_pid_alive(pid: int) -> bool:
+    """Whether ``pid`` is a running process, asked without signalling it.
+
+    ``os.kill(pid, 0)`` on Windows sends CTRL_C_EVENT — signal 0 is its value —
+    so the probe asks for a query handle instead (SPEC S39).
+    """
+    import ctypes
+
+    kernel = _kernel32()
+    handle = kernel.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return kernel.GetLastError() == _ERROR_ACCESS_DENIED  # exists, not ours
+    try:
+        code = ctypes.c_ulong(0)
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return True
+        return code.value == _STILL_ACTIVE
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def codes_by_role(auth: dict) -> dict[str, str]:
+    """A server's auth table as ``{code: role}`` strings, for the state file."""
+    return {code: getattr(role, "value", str(role)) for code, role in auth.items()}
+
+
+def best_code(codes: dict[str, str]) -> str:
+    """The code ``attach`` uses: the full-access one when there is one."""
+    for code, role in codes.items():
+        if role == "full":
+            return code
+    return next(iter(codes), "")
+
+
+def register_served(server, *, name: str, port: str, baud: int,
+                    owner: str = "uart-proxy", title: str = "",
+                    log_dir: Optional[str] = None, proxy_dir: Optional[str] = None,
+                    version: str = "") -> Optional[DaemonInfo]:
+    """Put a running ``ProxyServer`` in the registry, on any OS (SPEC S39).
+
+    For a foreground ``connect --serve`` and for an application that serves a
+    session of its own. ``name`` is a base: a live session using it gets
+    ``-2``, ``-3``… Never raises: a registry that cannot be written is a note
+    on stderr, and the session goes on being served.
+    """
+    codes = codes_by_role(server.auth)
+    try:
+        prune_dead()
+        info = DaemonInfo(
+            name=unique_name(name), pid=os.getpid(), port=port, baud=baud,
+            listen_host=server.host, listen_port=server.port,
+            auth=best_code(codes), codes=codes, log_dir=log_dir, proxy_dir=proxy_dir,
+            started_at=time.time(), version=version, foreground=True,
+            owner=owner, title=title,
+        )
+        info.write()
+    except OSError as exc:
+        print(f"Note: not registered for 'uart-proxy status' ({exc})", file=sys.stderr)
+        return None
+    return info
 
 
 def state_path(name: str) -> str:

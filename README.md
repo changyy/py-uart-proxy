@@ -45,6 +45,9 @@ Beyond the original seven:
   recording and the proxy alive after the terminal closes (POSIX).
 - **`attach` with replay** — rejoin a background session and see what happened
   while nobody was watching, with the timestamps it really happened at.
+- **Scripts and AI agents** — `tail` / `expect` / `send` from a shell, a
+  `SessionClient` for Python, and `uart-proxy mcp`, an MCP server through which
+  an AI tool reads a session you share and, if you allow it, types into it.
 
 ---
 
@@ -943,6 +946,52 @@ uart-proxy connect --port /dev/ttyUSB0 --plugin-dir ./plugins
 A plugin is a `Plugin` subclass — override `on_line` to react to patterns and
 optionally write back to the device. See
 [`plugins/example_alert_plugin.py`](./plugins/example_alert_plugin.py).
+
+### 9. Scripts and AI agents (`tail` / `expect` / `send`, `mcp`)
+
+A session that serves the proxy — `connect --serve`, a `start`ed one, or an app
+sharing one of its tabs — can be driven without a terminal. These are clients
+of the session, never a second owner of the port: whoever has it open keeps
+seeing everything sent and everything the device answers.
+
+```bash
+uart-proxy tail usbserial-110 -n 20                       # the last lines, stamped
+uart-proxy send usbserial-110 "uname -a" --expect Linux   # send, wait for the reply
+uart-proxy expect usbserial-110 "login:" --timeout 60 && echo booted
+```
+
+The name is the one `status` lists (the only session running needs none), or
+reach a server directly with `--host --port --auth`. `expect` and `send
+--expect` exit 1 when the text does not come in time.
+
+From Python, the same through `SessionClient`:
+
+```python
+from uart_proxy.client import SessionClient
+
+with SessionClient.from_registry("usbserial-110", want_full=True, client_name="my test") as dev:
+    mark = dev.cursor
+    dev.send_text("uname -a")
+    hit = dev.expect(r"Linux", timeout=5, since=mark)
+```
+
+**For an AI tool**, `uart-proxy mcp` is a Model Context Protocol server on
+stdio. Its tools: `list_sessions`, `session_status`, `tail`, `read_new` (only
+what the agent has not seen) and `wait_for`; with `--allow-send`, also
+`send_text` and `send_hex` — and only to a session shared with a full-access
+code. In Claude Desktop's `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "uart": { "command": "uart-proxy", "args": ["mcp"] }
+  }
+}
+```
+
+or with Claude Code: `claude mcp add uart -- uart-proxy mcp`. Add
+`--allow-send` to the arguments to let the agent type. The agent connects
+under the name `uart-proxy mcp (<its name>)`, which the session's owner sees.
 
 ### Headless (no TUI)
 

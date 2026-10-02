@@ -144,6 +144,13 @@ The seven original requirements, implemented end to end.
 
 ## v1.0 — Ecosystem
 
+- ✅ **Scripts and AI agents** (SPEC S39–S42): the registry on Windows too,
+  who-sent-it on TX, `SessionClient` + `tail` / `expect` / `send`, and
+  `uart-proxy mcp` — an MCP server that reads a shared session and, with
+  `--allow-send` and a full-access code, types into it.
+  - ⬜ Ask before each send: a hook the session's owner answers (an app shows
+    the bytes, Allow / Deny).
+  - 💡 Byte-level tools (hex frames with timing) for binary protocols.
 - ⬜ **Plugin discovery via entry points** (pip-installable plugins).
 - ⬜ **Richer plugin hooks**: `on_data` (raw), `on_match` with capture groups,
   timers, and the ability to register UI panels.

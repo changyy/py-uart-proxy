@@ -163,11 +163,17 @@ def test_a_second_serving_connect_on_the_same_stem_gets_its_own_name():
         proxy.stop()
 
 
-def test_registration_is_skipped_where_the_registry_cannot_work(monkeypatch):
+def test_s39_a_serving_connect_registers_where_it_cannot_detach(monkeypatch):
+    # Windows: no fork, so no `start` — but the registry works (S39).
     monkeypatch.setattr(cli, "DAEMON_SUPPORTED", False)
     proxy = _proxy({"rw": Role.FULL})
-    assert register_foreground(_connect_args(), proxy, None) is None
-    assert list_daemons(include_dead=True) == []
+    proxy.start()
+    try:
+        info = register_foreground(_connect_args(), proxy, None)
+        assert info is not None and info.foreground is True and info.owner == "uart-proxy"
+        assert [d.name for d in list_daemons()] == [info.name]
+    finally:
+        proxy.stop()
 
 
 @posix_only

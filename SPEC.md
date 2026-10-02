@@ -1248,3 +1248,159 @@ connecting is sent on connect and again after a reconnect; a read-only client
 neither sends it nor, if it does, has it applied; nonsense is ignored; a device
 without sizes keeps the client; and the whole chain — client → proxy →
 `telnet://` → the far telnet server — delivers NAWS with the client's size.
+
+## S39. The session registry on every OS
+
+The registry (S17, S23) is how anything on this machine finds a session that
+serves the proxy: `status`, `attach`, and now the session client and the MCP
+server (S41, S42). It was POSIX-only because its liveness probe,
+`os.kill(pid, 0)`, is not a probe on Windows — signal 0 there is
+`CTRL_C_EVENT`. With a probe that is one, the registry works everywhere;
+detaching (`start`) stays POSIX-only.
+
+- **Liveness** asks the OS without touching the process: POSIX
+  `os.kill(pid, 0)`; Windows `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
+  then `GetExitCodeProcess` = `STILL_ACTIVE` (access denied means it exists).
+  `os.kill` is never called on Windows.
+- **A foreground `connect --serve` registers on every OS** (S23), as does any
+  program serving a session: `register_served(server, …)` writes the entry
+  for a running `ProxyServer` — name, pid, bound address, every code with its
+  role — and returns it; `DaemonInfo.remove()` takes it away. Writing never
+  fails the caller: an unwritable registry is reported, and serving goes on.
+- Entries gain two optional fields: **`owner`** (who serves it: `uart-proxy`,
+  or an embedding application such as `uartist`) and **`title`** (what to
+  call it, e.g. the tab's port). Older files load, as `uart-proxy` / no title.
+- The state file stays `0600` on POSIX. On Windows the file lives in the
+  user's profile, whose permissions already keep other users out; `chmod`
+  there is best-effort.
+
+**Acceptance**
+- With the platform made Windows, `is_alive` uses the Windows probe and never
+  `os.kill` (a recorded fake); a live pid is alive, a gone one is not, access
+  denied is alive.
+- `register_served` writes owner, title, codes and the bound port; `status
+  --json` lists it from another process; `remove()` deletes it; a write
+  failure returns `None` with a note and does not raise.
+- A file without `owner` / `title` loads as `uart-proxy` / `""`.
+
+## S40. Who sent it
+
+A shared session has several writers: the person at the keyboard, and any
+proxy client with the `full` role. What each one sent should be told apart —
+in the TUI, in an embedding app, and in the recording.
+
+- `UartSession.write(data, *, origin=None)`: the `DATA(TX)` and `LINE(TX)`
+  events it publishes carry `meta["origin"]` when one is given. The proxy
+  writes with `{"via": "proxy", "role": …, "client": …, "address": …}`;
+  local typing has no origin.
+- **`auth.client`** (optional, ≤ 64 characters, client → server): a name for
+  the client, e.g. `uart-proxy mcp (claude-ai)`. Kept for the connection,
+  shown in `clients()` and in the origin. Older clients do not send it.
+- `ProxyServer.clients()` lists the authenticated connections: address, role,
+  client name, when it connected — what an app shows as "1 connection".
+
+**Acceptance**
+- A proxy client's `tx` produces `DATA(TX)` / `LINE(TX)` events whose origin
+  names `proxy`, its role, its client name and address; a local `write`
+  produces none.
+- `clients()` lists a connected client with its name and role, and drops it
+  when it disconnects; a name longer than 64 characters is cut to 64.
+
+## S41. The session client, and `tail` / `expect` / `send`
+
+A script, a test, or an AI agent wants three things from a running session:
+what it said lately, to wait until it says something, and to send a line.
+`attach` is a person's view and stays one; this is the programmatic one.
+
+- **`uart_proxy.client.SessionClient`** connects to a served session by
+  registry name (`SessionClient.from_registry(name)`), or by host, port and
+  code. It speaks the proxy protocol (S6, S18, S40): asks for replay, adopts
+  the server's elapsed, names itself (`client`).
+- It keeps the session's **lines**, each `{n, wall, elapsed, text, replayed}`,
+  in a bounded ring (oldest dropped, counted). Lines are assembled from `rx`
+  bytes as the session assembles them (S3); each carries the stamp of the
+  chunk that completed it. `text` is cleaned for reading: terminal escape
+  sequences and control characters other than tab removed. The line still
+  being written (a prompt with no newline yet) is the **partial line**.
+- `read(cursor)` → the lines after `cursor`, the new cursor, and how many were
+  dropped in between: a reader that keeps its cursor misses nothing it is
+  told about. `tail(n)` → the last `n`.
+- `expect(pattern, timeout, *, since=None)` waits for a line — or the partial
+  line, so `login:` and `#` prompts count — matching a regular expression,
+  among lines after `since` (default: from the moment of the call). Returns
+  the matching line and the lines before it, or `None` on timeout.
+- `send_text(text, eol="cr")`, `send_hex(hex)`; refused locally with a clear
+  error for a `readonly` connection (the server would refuse it too, S6).
+- **CLI**, for scripts and shells, by registry name or
+  `--host/--port/--auth`:
+  - `uart-proxy tail [NAME] [-n 50]` prints the last lines, stamped.
+  - `uart-proxy expect [NAME] PATTERN [--timeout 10]` exits 0 with the
+    matching line printed, 1 on timeout.
+  - `uart-proxy send [NAME] TEXT [--hex] [--eol cr] [--expect PATTERN
+    --timeout 10]` sends, and with `--expect` waits for the reply; exits 1 if
+    it does not come.
+
+**Acceptance** (against a real `ProxyServer` on a fake source)
+- Replayed lines arrive first, marked `replayed`, with the server's stamps;
+  live lines follow with increasing `n`.
+- `read` with a cursor returns only newer lines; after the ring overflowed
+  it reports the dropped count.
+- `expect` matches a complete line, matches a partial `login: ` prompt,
+  ignores lines from before the call, and returns `None` after its timeout.
+- Text is cleaned (`\x1b[32mok\x1b[0m` → `ok`), and invalid UTF-8 is replaced,
+  never raises.
+- A readonly client's `send_text` raises and the device receives nothing.
+- `uart-proxy send … --expect` against a session that echoes exits 0; `expect`
+  for text that never comes exits 1 after its timeout.
+
+## S42. An MCP server for AI tools
+
+`uart-proxy mcp` lets an AI tool — Claude Desktop, Claude Code, any Model
+Context Protocol client — read a session someone shares, and, when allowed,
+type into it. It is a **client of served sessions** (S41), never the owner of
+a port: whatever holds the port (a `connect --serve`, a `start`ed session, an
+application embedding the proxy) stays where a person can watch it.
+
+- **Transport**: MCP over stdio — JSON-RPC 2.0, one message per line on
+  stdin / stdout. Nothing but protocol goes to stdout; logs go to stderr.
+  Implemented with the standard library only.
+- **Methods**: `initialize` (answers the client's protocol version when it is
+  one we know, else our newest; capabilities `tools`), `notifications/
+  initialized`, `ping`, `tools/list`, `tools/call`. Unknown methods get
+  JSON-RPC error `-32601`; bad arguments `-32602`; a tool that fails answers
+  with `isError: true` and a message, so the agent can read why.
+- **Tools** (each takes `session`, optional when exactly one is running):
+  - `list_sessions` — name, title, owner, port, and whether this server can
+    send to it.
+  - `session_status` — device state, access, lines seen, last activity.
+  - `read_new` — the lines since this server last read that session (it
+    keeps the cursor), with a note when some were dropped.
+  - `tail` — the last `lines` (default 50).
+  - `wait_for` — S41's `expect`: `pattern`, `timeout` (default 10 s, at most
+    120), over what this server has not handed back yet — output since the
+    last `read_new` or the last match — so a reply that came before the call
+    still counts. A match moves that mark past it.
+  - `send_text` / `send_hex` — **only with `--allow-send`**, and only to a
+    session reached with a `full` code; each may take `wait_for` and
+    `timeout` to send and wait for the reply in one call.
+- **Access is the session's to give**: the server connects with the
+  session's read-only code when it has one (always, without `--allow-send`),
+  else its full code — and then never writes without `--allow-send`. It names
+  itself `uart-proxy mcp (<client name>)` (S40), so the session's owner sees
+  who is attached.
+- **Results are bounded**: at most 200 lines and 20 000 characters each, cut
+  from the oldest with a note; lines are S41's cleaned text with their local
+  and elapsed stamps.
+
+**Acceptance** (driving `uart-proxy mcp` as a subprocess over pipes)
+- `initialize` answers a known version with it and an unknown one with ours;
+  `tools/list` lists the read tools, and the send tools only with
+  `--allow-send`.
+- Against a served fake session: `tail` returns its lines with stamps;
+  `read_new` twice returns only what is new the second time; `wait_for`
+  returns the line and times out cleanly.
+- `send_text` without `--allow-send` is not a tool (`-32602`); with it, to a
+  read-only session, is an error result and the device receives nothing;
+  with a full code it reaches the device and `wait_for` returns the echo.
+- Bad JSON and unknown methods get JSON-RPC errors, and the server keeps
+  serving; stdout carries only JSON-RPC lines.

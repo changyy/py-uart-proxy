@@ -33,6 +33,8 @@ from .core.daemon import (
     DAEMON_SUPPORTED,
     DaemonInfo,
     DaemonNotFound,
+    best_code,
+    codes_by_role,
     connect_host,
     daemonize,
     find_daemon,
@@ -40,6 +42,7 @@ from .core.daemon import (
     new_auth_code,
     prune_dead,
     read_state,
+    register_served,
     stop_daemon,
     unique_name,
 )
@@ -94,7 +97,7 @@ def port_choices(scan: Optional[Callable[[], list]] = None) -> list:
     scan = scan or _scan_ports  # looked up now, so it can be replaced
 
     try:
-        held = list_daemons() if DAEMON_SUPPORTED else []
+        held = list_daemons()
     except OSError:
         held = []
     choices = []
@@ -656,8 +659,6 @@ def attach_move_report(session: UartSession, source: UartSource) -> None:
         session.publish_notice(
             f"device moved: {old} → {new} — the same adapter ({who}), "
             f"re-enumerated after a replug; following it")
-        if not DAEMON_SUPPORTED:
-            return
         try:
             for info in list_daemons():
                 if info.pid == os.getpid():
@@ -762,47 +763,28 @@ def _trap_sigterm():
 
 
 def _codes_by_role(proxy: ProxyServer) -> dict[str, str]:
-    return {code: role.value for code, role in proxy.auth.items()}
+    return codes_by_role(proxy.auth)
 
 
 def _best_code(codes: dict[str, str]) -> str:
     """The code ``attach`` should use: full access if there is one."""
-    for code, role in codes.items():
-        if role == Role.FULL.value:
-            return code
-    return next(iter(codes), "")
+    return best_code(codes)
 
 
 def register_foreground(args: argparse.Namespace, proxy: ProxyServer,
                         log_dir: Optional[str]) -> Optional[DaemonInfo]:
-    """Put a ``connect --serve`` in the session registry (SPEC S23).
+    """Put a ``connect --serve`` in the session registry (SPEC S23, S39).
 
     The generated auth code scrolls away with the terminal; the registry is
     where ``status --show-auth`` and ``attach`` already look for a background
-    session's, so a foreground one goes there too — same 0600 file, removed on
-    exit, pruned by the next command if we die without tidying up.
-    POSIX only, like the registry's liveness check (``os.kill(pid, 0)`` is a
-    Ctrl-C on Windows, not a probe).
+    session's, so a foreground one goes there too — same private file, removed
+    on exit, pruned by the next command if we die without tidying up. Every OS:
+    the registry's liveness probe asks Windows properly (S39).
     """
-    if not DAEMON_SUPPORTED:
-        return None
-    codes = _codes_by_role(proxy)
-    try:
-        prune_dead()
-        info = DaemonInfo(
-            name=unique_name(device_stem(args.port)), pid=os.getpid(),
-            port=args.port, baud=args.baud,
-            listen_host=args.listen, listen_port=proxy.port,
-            auth=_best_code(codes), codes=codes,
-            log_dir=log_dir, proxy_dir=getattr(args, "proxy_dir", None),
-            started_at=time.time(), version=__version__, foreground=True,
-        )
-        info.write()
-    except OSError as exc:
-        print(f"Note: not registered for 'uart-proxy status' ({exc})",
-              file=sys.stderr)
-        return None
-    return info
+    return register_served(
+        proxy, name=device_stem(args.port), port=args.port, baud=args.baud,
+        log_dir=log_dir, proxy_dir=getattr(args, "proxy_dir", None), version=__version__,
+    )
 
 
 def session_info_lines(
@@ -1162,7 +1144,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "log_dir": d.log_dir, "proxy_dir": d.proxy_dir,
                     "started_at": d.started_at, "uptime": d.uptime,
                     "last_activity": d.last_activity(), "version": d.version,
-                    "foreground": d.foreground,
+                    "foreground": d.foreground, "owner": d.owner, "title": d.title,
                     **({"auth": _status_codes(d)} if args.show_auth else {}),
                 }
                 for d in daemons
@@ -1756,6 +1738,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_client_mirror_args(p_rem, default_name="<host>-<port>")
     _add_common_io_args(p_rem)
     p_rem.set_defaults(func=cmd_remote)
+
+    # tail / expect / send: a served session from a script (SPEC S41)
+    from . import client_cli
+
+    client_cli.add_parsers(sub)
+    # mcp: an MCP server for AI tools (SPEC S42)
+    from . import mcp
+
+    mcp.add_parser(sub)
 
     return parser
 

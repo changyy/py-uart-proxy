@@ -56,6 +56,11 @@ class LineAssembler:
     def has_pending(self) -> bool:
         return len(self._buf) > 0
 
+    @property
+    def pending(self) -> bytes:
+        """The partial line so far, without consuming it (a prompt, say)."""
+        return bytes(self._buf).rstrip(b"\r")
+
     def flush(self) -> bytes | None:
         """Return and clear any buffered partial line, or ``None`` if empty."""
         if not self._buf:

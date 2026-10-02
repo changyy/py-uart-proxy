@@ -212,8 +212,14 @@ class UartSession:
 
     # ── write path ───────────────────────────────────────────────────────────
 
-    def write(self, data: bytes) -> int:
-        """Send raw bytes to the source and publish TX events."""
+    def write(self, data: bytes, *, origin: Optional[dict] = None) -> int:
+        """Send raw bytes to the source and publish TX events.
+
+        ``origin`` says who sent them (SPEC S40) — the proxy passes its client —
+        and travels in the TX events' ``meta["origin"]``. A line completed by
+        this write carries this write's origin.
+        """
+        meta = {"origin": origin} if origin is not None else {}
         if not self._connected:
             raise RuntimeError("not connected (waiting for the device)")
         written = self.source.write(data)
@@ -227,10 +233,11 @@ class UartSession:
                 seq=next(self._seq),
                 data=data,
                 text=self._decode(data),
+                meta=dict(meta),
             )
         )
         for raw_line in self._tx_asm.feed(data):
-            self._emit_line(raw_line, Direction.TX)
+            self._emit_line(raw_line, Direction.TX, meta)
         return written
 
     def send_text(self, text: str, eol: Optional[bytes] = None) -> int:
@@ -240,7 +247,8 @@ class UartSession:
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
-    def _emit_line(self, raw_line: bytes, direction: Direction) -> None:
+    def _emit_line(self, raw_line: bytes, direction: Direction,
+                   meta: Optional[dict] = None) -> None:
         stamp = self.tracker.stamp()
         self._emit(
             Event(
@@ -250,6 +258,7 @@ class UartSession:
                 seq=next(self._seq),
                 data=raw_line,
                 text=self._decode(raw_line),
+                meta=dict(meta or {}),
             )
         )
 
