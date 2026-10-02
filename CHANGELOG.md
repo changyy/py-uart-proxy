@@ -1,9 +1,14 @@
 # Changelog
 
-## [Unreleased]
+## [1.20261003.1000725] — 2026-10-03
 
 Scripts and AI agents can now drive a session somebody shares — and the person
 sharing it still sees everything.
+
+The first release on PyPI since 1.20260929.1214712: it also carries everything
+listed under 1.20260930.1204523 and 1.20260930.1205413 below, and two fixes
+made after them — a stopped proxy frees its port at once on Linux, and a test
+race against the fake telnet server.
 
 ### Added
 - **`uart-proxy mcp`** (SPEC S42): a Model Context Protocol server on stdio for
