@@ -32,7 +32,7 @@ viewer, recorder, proxy, plugins, and UI on top of it.
 | 4 | Re-share the port via a socket proxy with auth | ✅ `--serve --auth CODE[:role]` |
 | 5 | Command-line driven | ✅ `uart-proxy …` |
 | 6 | Connect to a **local UART** or a **remote socket** | ✅ `connect` / `remote` |
-| 7 | Plugin architecture for pattern watching (grep-style) | ✅ `--grep`, `--plugin-dir`, `Plugin` API |
+| 7 | Plugin architecture for pattern watching (grep-style) | ✅ `--grep`, `--rules`, `--plugin-dir`, `Plugin` API |
 
 Beyond the original seven:
 
@@ -954,6 +954,31 @@ A plugin is a `Plugin` subclass — override `on_line` to react to patterns and
 optionally write back to the device. See
 [`plugins/example_alert_plugin.py`](./plugins/example_alert_plugin.py).
 
+**Rules, without code** (`--rules`): when the device says X, mark it, tell
+you, or send Y. A rule is data — a text, regular expression, byte sequence,
+silence or device state, with limits — so it can be shared, checked and
+reviewed:
+
+```json
+{"rules": [
+  {"name": "panic", "when": {"text": "Kernel panic"}, "actions": [{"kind": "notify"}]},
+  {"name": "hung", "when": {"silence": 30}, "actions": [{"kind": "notify"}]},
+  {"name": "auto-login", "when": {"text": "login:"}, "limit": {"cooldown": 5},
+   "actions": [{"kind": "send", "text": "root", "eol": "cr"}]}
+]}
+```
+
+```bash
+uart-proxy connect --port /dev/ttyUSB0 --rules rules.json                   # sending rules stay off
+uart-proxy connect --port /dev/ttyUSB0 --rules rules.json --approve-rules   # …or act
+```
+
+Every firing is an event: shown as a notice when the rule notifies, and
+written beside the recording as `output-events.jsonl`. No rule runs a
+program or reaches the network, and nothing from a match is ever sent back —
+what a device prints never becomes what it is told. A rule that fires more
+than 30 times a minute turns itself off.
+
 ### 9. Scripts and AI agents (`tail` / `expect` / `send`, `mcp`)
 
 A session that serves the proxy — `connect --serve`, a `start`ed one, or an app
@@ -1004,7 +1029,15 @@ gives a verdict — `ok`, `degraded` (just reconnected, or connecting) or `down`
 person can act on ("re-plug the USB-serial adapter", "share the tab again").
 Results from a session that is not well say so first; `wait_for_device` waits
 for it to come back after the person re-plugs it; and a change of the verdict
-is sent as an MCP notification. Add
+is sent as an MCP notification.
+
+The agent can also **watch**: `watch_add` asks the session to report a text,
+pattern or byte sequence (at most 3 per agent by default — the session's
+`--max-watches`), and `wait_for_event` / `read_events` return what fired,
+with the lines before it. A watch only reports. With `--allow-send`,
+`propose_rule` proposes a rule that answers by itself; the session's owner
+decides (an app asks its person — UARTist does, when they allowed one
+proposal; `uart-proxy connect --serve` refuses every proposal). Add
 `--allow-send` to the arguments to let the agent type. The agent connects
 under the name `uart-proxy mcp (<its name>)`, which the session's owner sees.
 

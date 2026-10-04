@@ -18,13 +18,15 @@ a slow client can never stall the serial pump.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import queue
 import socket
 import threading
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Callable, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..core.events import Direction, Event, EventKind
 from ..core.replay import ReplayBuffer
@@ -32,6 +34,7 @@ from .protocol import EOL_MAP, Role, decode_message, encode_message
 
 if TYPE_CHECKING:  # avoid a circular import; only needed for type hints
     from ..core.session import UartSession
+    from ..core.triggers import Triggers
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,26 @@ CLIENT_NAME_MAX = 64
 MAX_AUTH_FAILURES = 10
 FAIL_WINDOW = 60.0
 BAN_SECONDS = 600.0
+
+
+@dataclass
+class TriggerPolicy:
+    """What proxy clients may do with the session's triggers (SPEC S47) — the
+    session owner's choice, never the client's.
+
+    ``max_watches``: level-0 watches per connection (0 refuses them all).
+    ``propose``: called with ``(rule, client)`` for a client's proposed rule —
+    the rule as it would act, the client's ``name``, ``role`` and ``address``
+    — and returns True to add it. ``None`` refuses every proposal. It may
+    block (a person deciding); it runs on its own thread.
+    """
+
+    max_watches: int = 3
+    propose: Optional[Callable[[dict, dict], bool]] = None
+
+
+_PROPOSAL_IDS = itertools.count(1)
+_CONNECTION_IDS = itertools.count(1)
 
 
 def _wire_health(h: dict) -> dict:
@@ -118,6 +141,8 @@ class _Client:
         self.conn = conn
         self.addr = addr
         self.role: Optional[Role] = None
+        #: Who this connection is to the session's triggers (S47).
+        self.cid = f"c{next(_CONNECTION_IDS)}"
         #: The name the client gave itself (``auth.client``), if any (S40).
         self.name = ""
         self.connected_at = time.time()
@@ -194,8 +219,14 @@ class ProxyServer:
         limiter: Optional[AuthLimiter] = None,
         max_clients: int = MAX_CLIENTS,
         echo_tx: bool = False,
+        triggers: Optional["Triggers"] = None,
+        trigger_policy: Optional[TriggerPolicy] = None,
     ) -> None:
         self.session = session
+        # S47: the session's triggers, and what clients may do with them.
+        self.triggers = triggers
+        self.trigger_policy = trigger_policy or TriggerPolicy()
+        self._sid = f"s{id(self)}"
         self.auth = auth
         self.limiter = limiter or AuthLimiter()
         self.max_clients = max_clients
@@ -258,6 +289,10 @@ class ProxyServer:
             self._clients.clear()
         for client in clients:
             client.shutdown()
+        # The share is over: what its AI clients added goes with it — unless the
+        # person kept it (it is then theirs, owner "person").
+        if self.triggers is not None:
+            self.triggers.remove_where(lambda r: r["owner"].get("server") == self._sid)
 
     @property
     def client_count(self) -> int:
@@ -354,6 +389,9 @@ class ProxyServer:
             with self._clients_lock:
                 self._clients.discard(client)
             client.shutdown()
+            if self.triggers is not None:
+                self.triggers.remove_where(lambda r: r["owner"].get("connection") == client.cid
+                                           and r["owner"].get("server") == self._sid)
             logger.info("Client %s disconnected", addr)
 
     @staticmethod
@@ -471,6 +509,91 @@ class ProxyServer:
                 client.enqueue(encode_message({"type": "pong"}))
             elif mtype == "resize":
                 self._handle_resize(client, msg)
+            elif mtype in ("watch_add", "watch_remove", "watch_list"):
+                self._handle_watch(client, mtype, msg)
+            elif mtype == "rule_propose":
+                self._handle_propose(client, msg)
+
+    # ── triggers (S47) ───────────────────────────────────────────────────────
+
+    def _ai_owner(self, client: _Client) -> dict:
+        return {"kind": "ai", "client": client.name or self._endpoint(client),
+                "connection": client.cid, "server": self._sid}
+
+    def _own_watches(self, client: _Client) -> list[dict]:
+        if self.triggers is None:
+            return []
+        return [r for r in self.triggers.list()
+                if r["owner"].get("connection") == client.cid and r["owner"].get("server") == self._sid
+                and r["level"] == 0]
+
+    def _reply(self, client: _Client, msg: dict) -> None:
+        client.enqueue(encode_message(msg))
+
+    def _handle_watch(self, client: _Client, mtype: str, msg: dict) -> None:
+        if self.triggers is None:
+            return self._reply(client, {"type": "watch_fail", "reason": "this session has no triggers"})
+        if mtype == "watch_list":
+            return self._reply(client, {"type": "watch_list", "watches": self._own_watches(client)})
+        if mtype == "watch_remove":
+            rid = str(msg.get("id", ""))
+            if not any(w["id"] == rid for w in self._own_watches(client)):
+                return self._reply(client, {"type": "watch_fail", "reason": f"no watch {rid} of yours"})
+            self.triggers.remove(rid)
+            return self._reply(client, {"type": "watch_ok", "id": rid})
+        limit = self.trigger_policy.max_watches
+        if "actions" in msg:
+            return self._reply(client, {"type": "watch_fail",
+                                        "reason": "a watch only makes events: no actions"})
+        if len(self._own_watches(client)) >= limit:
+            reason = ("the session's owner allows no watches" if limit <= 0
+                      else f"at most {limit} watches per connection")
+            return self._reply(client, {"type": "watch_fail", "reason": reason})
+        rule = {"name": str(msg.get("name") or "watch")[:80], "when": msg.get("when"),
+                "limit": msg.get("limit") or {}, "context": msg.get("context", 3),
+                "actions": [{"kind": "event"}], "owner": self._ai_owner(client)}
+        try:
+            rid = self.triggers.add(rule)
+        except ValueError as exc:
+            return self._reply(client, {"type": "watch_fail", "reason": str(exc)})
+        self._reply(client, {"type": "watch_ok", "id": rid})
+
+    def _handle_propose(self, client: _Client, msg: dict) -> None:
+        pid = f"p{next(_PROPOSAL_IDS)}"
+
+        def answer(status: str, **extra: Any) -> None:
+            self._reply(client, {"type": "proposal", "id": pid, "status": status, **extra})
+
+        if self.triggers is None:
+            return answer("refused", reason="this session has no triggers")
+        if client.role != Role.FULL:
+            return answer("refused", reason="read-only: a rule that acts needs a share that may send")
+        ask = self.trigger_policy.propose
+        if ask is None:
+            return answer("refused", reason="the session's owner takes no proposals now")
+        from ..core.triggers import normalise
+
+        try:
+            rule = normalise({**(msg.get("rule") or {}), "owner": self._ai_owner(client),
+                              "approved": None, "enabled": True})
+        except ValueError as exc:
+            return answer("refused", reason=str(exc))
+        info = {"client": client.name, "role": client.role.value, "address": self._endpoint(client)}
+
+        def decide() -> None:
+            try:
+                accepted = bool(ask(rule, info))
+            except Exception as exc:  # noqa: BLE001 - the owner's callback failed: no
+                logger.warning("proposal callback failed", exc_info=True)
+                return answer("refused", reason=f"the owner could not be asked: {exc}")
+            if not accepted:
+                return answer("declined")
+            rid = self.triggers.add(rule)
+            self.triggers.approve(rid)            # as the person saw it
+            answer("accepted", rule=rid)
+
+        answer("pending")
+        threading.Thread(target=decide, name=f"proposal-{pid}", daemon=True).start()
 
     def _handle_resize(self, client: _Client, msg: dict) -> None:
         """A client's window size, for a device that can use one (SPEC S38).
@@ -569,6 +692,11 @@ class ProxyServer:
             return {"type": "notice", "text": event.text, "meta": event.meta}
         if event.kind == EventKind.STATUS:
             return {"type": "status", "state": event.text, "meta": event.meta}  # since/reconnects added in _on_event
+        if event.kind == EventKind.TRIGGER:
+            event_msg = {k: v for k, v in event.meta.items() if k != "owner"}
+            owner = event.meta.get("owner") or {}
+            event_msg["owner"] = {"kind": owner.get("kind"), "client": owner.get("client")}
+            return {"type": "trigger", **event_msg}
         return None
 
     def _send_now(self, client: _Client, msg: dict) -> None:

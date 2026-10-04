@@ -1482,3 +1482,131 @@ attached during a drop believed it connected.
 
 **Acceptance**: a client's `last_seen` moves on with its pings and stays put
 when it is silent.
+
+## S46. Triggers: when the device says X, do Y
+
+A session can watch its own output and act on it — the grep plugin (S7)
+generalised, with limits, and without running anyone's code. Rules are data,
+never code; what they may do is ranked by risk.
+
+- **A rule**: `{id, name, owner, enabled, when, limit, context, actions}`.
+  - `owner`: `{"kind": "person"}`, or `{"kind": "ai", "client": <name>,
+    "connection": <id>}` for one made through the proxy (S47).
+  - `when` — one of:
+    - `text` (a substring) or `regex` (Python `re`), `case` sensitive or
+      not (default not), on `rx` lines (default) or `tx` lines. A prompt
+      without a newline (`login: `, `# `) is a line once S3's idle flush
+      emits it, so it needs nothing more;
+    - `hex`: a byte sequence in the `rx` stream, across chunks;
+    - `silence`: no `rx` for `seconds` while the device is connected (fires
+      once per silence);
+    - `state`: the device `disconnected`, `connected` or `reconnected` (S43).
+  - `limit`: `once`; `cooldown` seconds (default 1); `max_per_minute`
+    (default 30); `after` — fire on the n-th match within `window` seconds.
+  - `context`: how many lines before the match the event carries (0–20,
+    default 3).
+  - `actions`, each of a **level**; the rule's level is its highest action's:
+    - level 0 — `event` (always: every firing is an event), `mark` (the
+      match is marked for viewers), `notify` (asks the embedding app or the
+      TUI to tell the person);
+    - level 1 — `send`: literal `text` with `eol`, or `hex`. Nothing from the
+      match is put into what is sent (no captures, no templates): what a
+      device prints never becomes what it is told.
+    - There is no level 2 here — no action runs a program or reaches the
+      network.
+- **Safe by construction**:
+  - Patterns are checked when a rule is added: a regex must compile, be at
+    most 512 characters, and not nest repetition (`(a+)+`, `(.*)*`), so a
+    long line cannot stall the session; matching looks at the first 4096
+    characters of a line.
+  - A rule that hits `max_per_minute` is disabled, with the reason, and a
+    notice says so.
+  - A `send` rule does not fire on an `rx` line equal to what it sent in the
+    last 2 s (the device's echo), nor on its own `tx`.
+  - A rule's `send` goes through `UartSession.write` with `origin = {"via":
+    "rule", "rule": id, "owner": …}` (S40) — recorded and shown like any
+    other writer — and is skipped, with a notice, when the session cannot be
+    written.
+  - Every level-1 rule carries `approved`: the SHA-256 of its `when`,
+    `limit` and `actions` at the time a person approved it. A level-1 rule
+    whose content no longer matches its `approved` hash does not act.
+    Rules loaded from a file (import) arrive disabled and unapproved.
+- **An event**: `{seq, rule, name, owner, wall, elapsed, line, groups,
+  context, actions: [{kind, ok, detail}]}`, published on the session's bus
+  as `TRIGGER`, written beside the recording as `<base>-events.jsonl` (one
+  JSON object per line), and kept in a ring of the last 500
+  (`events(since=seq)`). A rule with `notify` also publishes a notice
+  `⚡ <name>: <line>`, which the TUI shows.
+- **API**: `session.triggers` — `add(rule) -> id` (raises `ValueError` naming
+  what is wrong), `remove(id)`, `enable(id, on)`, `list()`, `events(since)`;
+  rule files are JSON (`load(path)` / `dump(path)`).
+- **CLI**: `uart-proxy connect … --rules FILE` loads rules (level-1 rules
+  only with `--approve-rules`, which approves them as loaded; otherwise they
+  load off, and it says so).
+
+**Acceptance**
+- A `text` rule fires once for a matching `rx` line and not for a clean one;
+  `regex` groups reach the event; a `login: ` prompt with no newline fires it
+  once flushed; `hex` matches a sequence split across two chunks;
+  `silence` fires once after its seconds and again only after new output;
+  `state` fires on a drop and on the return.
+- `once`, `cooldown`, `after n within window` behave as named; a rule past
+  `max_per_minute` is disabled with its reason.
+- Nested repetition, an over-long or invalid regex, and `{1}` in a `send` are
+  refused when added; a 1 MB line is matched without stalling.
+- A `send` rule writes with a `rule` origin; it does not fire on the device's
+  echo of what it sent; on a read-only session it is skipped with a notice;
+  edited after approval, it does not act.
+- Events are numbered, carry their context lines, reach `events(since)`, and
+  are in `<base>-events.jsonl`.
+- `--rules FILE` loads rules; one that sends stays off without
+  `--approve-rules`, and is approved with it.
+
+## S47. Triggers through the proxy, and for AI tools
+
+A proxy client — an AI tool's MCP server above all — may ask the session to
+watch for something and tell it when it happens. Whether it may, and how
+much, is the session owner's to decide, never the client's.
+
+- **Protocol** (client → server, after `auth`):
+  - `{"type": "watch_add", "name", "when", "limit", "context"}` — a level-0
+    rule (no `actions` field is accepted: a watch only makes events) →
+    `{"type": "watch_ok", "id"}` or `{"type": "watch_fail", "reason"}`.
+  - `{"type": "watch_remove", "id"}`, `{"type": "watch_list"}` → the
+    client's own watches.
+  - `{"type": "rule_propose", "rule"}` — a level-1 rule, `full` role only →
+    `{"type": "proposal", "id", "status"}` with `status` `refused`
+    (not allowed now), then, if it was put to the owner, `accepted` or
+    `declined`.
+  - server → client: `{"type": "trigger", …event}` for every event of the
+    session (a client can read every line anyway).
+- **The owner's policy** (`ProxyServer(…, triggers=TriggerPolicy(...))`):
+  - `max_watches` per connection (default 3; 0 refuses all); a client's
+    watches are removed when it disconnects;
+  - `propose`: a callable the owner supplies — `None` (the default) refuses
+    every proposal; an app passes one that asks the person (UARTist: D41).
+    An accepted proposal becomes a level-1 rule owned by `ai`, approved as
+    the person saw it.
+  - `uart-proxy connect --serve` / `start`: `--max-watches N` (default 3);
+    proposals are always refused (no one to ask).
+- **MCP** (S42): tools `watch_add` (`pattern` with `regex`, or `hex`;
+  `name`, `context`), `watch_list`, `watch_remove`, `read_events` (since this
+  server last read, at most 200), `wait_for_event` (`timeout`, optionally one
+  `watch`; as `wait_for`, an event not yet handed back counts even if it came
+  first); `propose_rule` (`pattern` / `hex`, `send_text` + `eol` or
+  `send_hex`, `name`, `timeout` up to 150 s) only with `--allow-send`,
+  answering what the owner decided. The watch tools are read tools: listed
+  without `--allow-send`. Events also arrive as `notifications/message`
+  (`notice`), with the session, the rule's name, `seq` and the line.
+
+**Acceptance** (a real `ProxyServer` on a fake source; MCP over pipes)
+- A read-only client adds a watch and receives `trigger` when the device
+  prints its pattern; its fourth watch is refused with the default policy;
+  disconnecting removes its watches.
+- A `watch_add` with `actions` is refused; a `rule_propose` from a read-only
+  client, or with no `propose` callable, is `refused`; with a callable that
+  accepts, the rule is added, owned by `ai`, and its `send` reaches the
+  device with a `rule` origin.
+- Over MCP: `watch_add`, then `wait_for_event` returns the event when the
+  device prints the pattern; `read_events` returns it once; `propose_rule`
+  is not listed without `--allow-send`.

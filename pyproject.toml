@@ -57,6 +57,11 @@ uart-proxy = "uart_proxy.cli:main"
 [tool.hatch.version]
 path = "src/uart_proxy/_version.py"
 
+[tool.uv]
+# The version is read from _version.py: rebuild the installed package when it
+# changes, or its metadata keeps the old version (test_version fails).
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/uart_proxy/_version.py" }]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/uart_proxy"]
 

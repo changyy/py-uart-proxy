@@ -171,7 +171,9 @@ def test_s42_send_tools_exist_only_with_allow_send(mcp):
     read_only = mcp()
     read_only.start()
     names = {t["name"] for t in read_only.call("tools/list")["result"]["tools"]}
-    assert names == {"list_sessions", "session_status", "read_new", "tail", "wait_for", "wait_for_device"}
+    assert names == {"list_sessions", "session_status", "read_new", "tail", "wait_for", "wait_for_device",
+                     # S47: watches only report, so they are read tools
+                     "watch_add", "watch_list", "watch_remove", "read_events", "wait_for_event"}
     allowed = mcp("--allow-send")
     allowed.start()
     tools = allowed.call("tools/list")["result"]["tools"]

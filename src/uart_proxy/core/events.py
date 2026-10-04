@@ -23,6 +23,7 @@ class EventKind(str, enum.Enum):
     LINE = "line"      # a fully assembled line (timestamped logs + plugins)
     NOTICE = "notice"  # a plugin or system message worth surfacing
     STATUS = "status"  # a connection/session state change
+    TRIGGER = "trigger"  # a rule fired (S46); the event is in ``meta``
 
 
 class Direction(str, enum.Enum):

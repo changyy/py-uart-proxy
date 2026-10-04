@@ -32,6 +32,7 @@ MAX_LINES = 200
 MAX_CHARS = 20_000
 MAX_TIMEOUT = 120.0
 MAX_DEVICE_WAIT = 600.0
+MAX_PROPOSAL_WAIT = 150.0   # a person reads the rule and decides (UARTist arms for 120 s)
 #: How often an attached session's health is looked at, for notifications (S44).
 WATCH_SECONDS = 0.5
 _NOTE_LEVEL = {"down": "warning", "degraded": "notice", "ok": "info"}
@@ -106,6 +107,60 @@ READ_TOOLS = [
                      "description": f"Seconds to wait (default 60, at most {MAX_DEVICE_WAIT:g})."}}}},
 ]
 
+_WHEN_PROPS = {
+    "pattern": {"type": "string", "description": "Text to look for in the device's lines "
+                "(case-insensitive), or a regular expression with regex: true."},
+    "regex": {"type": "boolean", "description": "pattern is a regular expression (Python syntax)."},
+    "hex": {"type": "string", "description": "Instead of pattern: a byte sequence as hex (\"5A 03\")."},
+}
+
+WATCH_TOOLS = [
+    {"name": "watch_add", "title": "Watch for something",
+     "description": "Ask the session to tell you whenever the device prints something — a text, a "
+                    "regular expression or a byte sequence. A watch only reports (events, with the "
+                    "lines before the match); it never acts. The session's owner allows a few per "
+                    "connection, and they end when you disconnect.",
+     "inputSchema": {"type": "object", "properties": {
+         "session": _session_arg(), **_WHEN_PROPS,
+         "name": {"type": "string", "description": "A short name for what it watches."},
+         "context": {"type": "integer", "minimum": 0, "maximum": 20,
+                     "description": "Lines before the match to include (default 3)."}}}},
+    {"name": "watch_list", "title": "Your watches",
+     "description": "The watches you added to this session.",
+     "inputSchema": {"type": "object", "properties": {"session": _session_arg()}}},
+    {"name": "watch_remove", "title": "Remove a watch",
+     "description": "Remove one of your watches.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {
+         "session": _session_arg(), "id": {"type": "string"}}}},
+    {"name": "read_events", "title": "Read new events",
+     "description": "Events since you last called read_events: every rule of the session that "
+                    "fired — your watches and the person's rules — with the line and its context.",
+     "inputSchema": {"type": "object", "properties": {"session": _session_arg()}}},
+    {"name": "wait_for_event", "title": "Wait for an event",
+     "description": "Wait until a rule of the session fires (one watch, with watch: its id).",
+     "inputSchema": {"type": "object", "properties": {
+         "session": _session_arg(), "watch": {"type": "string"}, "timeout": _timeout_arg(10)}}},
+]
+
+PROPOSE_TOOLS = [
+    {"name": "propose_rule", "title": "Propose an automatic reply",
+     "description": "Propose a rule that types into the device by itself when it prints something "
+                    "(\"when it asks login:, send root\"). The person sharing the session decides: "
+                    "they must have allowed one proposal in UARTist, and then see exactly what it "
+                    "matches and sends. What it sends is fixed text or bytes; nothing from the "
+                    "match is sent. Waits for their answer.",
+     "inputSchema": {"type": "object", "properties": {
+         "session": _session_arg(), **_WHEN_PROPS,
+         "name": {"type": "string", "description": "A short name for the rule."},
+         "send_text": {"type": "string", "description": "What to type."},
+         "eol": {"type": "string", "enum": ["cr", "lf", "crlf", "none"],
+                 "description": "Line ending after send_text (default cr)."},
+         "send_hex": {"type": "string", "description": "Instead of send_text: bytes as hex."},
+         "timeout": {"type": "number", "minimum": 0, "maximum": MAX_PROPOSAL_WAIT,
+                     "description": f"Seconds to wait for the person (default 120, at most "
+                                    f"{MAX_PROPOSAL_WAIT:g})."}}}},
+]
+
 SEND_TOOLS = [
     {"name": "send_text", "title": "Send a line",
      "description": "Type a line into the device, followed by a line ending (default CR), and "
@@ -159,6 +214,8 @@ class _Shared:
     def __init__(self, client: SessionClient) -> None:
         self.client = client
         self.cursor = 0          # read_new: lines up to here were returned
+        self.events = 0          # read_events: events up to this seq were returned
+        self.event_mark = 0      # wait_for_event: matched or returned up to here
         self.mark = 0            # wait_for: matched or returned up to here
         self.level: Optional[str] = None   # the verdict last notified (S44)
 
@@ -175,16 +232,20 @@ class McpServer:
         self._sessions_lock = threading.Lock()
         self._inflight: set[threading.Thread] = set()
         self._inflight_lock = threading.Lock()
-        self.tools = READ_TOOLS + (SEND_TOOLS if allow_send else [])
+        self.tools = READ_TOOLS + WATCH_TOOLS + (SEND_TOOLS + PROPOSE_TOOLS if allow_send else [])
         self._handlers = {
             "list_sessions": self._list_sessions, "session_status": self._status,
             "read_new": self._read_new, "tail": self._tail, "wait_for": self._wait_for,
             "wait_for_device": self._wait_for_device,
+            "watch_add": self._watch_add, "watch_list": self._watch_list,
+            "watch_remove": self._watch_remove, "read_events": self._read_events,
+            "wait_for_event": self._wait_for_event,
         }
         self._known: set[str] = set()       # sessions attached to before (S44)
         threading.Thread(target=self._watch, daemon=True, name="mcp-health").start()
         if allow_send:
-            self._handlers.update(send_text=self._send_text, send_hex=self._send_hex)
+            self._handlers.update(send_text=self._send_text, send_hex=self._send_hex,
+                                  propose_rule=self._propose_rule)
 
     # ── the wire ───────────────────────────────────────────────────────────
 
@@ -290,7 +351,7 @@ class McpServer:
         if handler is None:
             raise _Params(f"unknown tool {name!r}"
                           + (" (sending needs 'uart-proxy mcp --allow-send')"
-                             if name in ("send_text", "send_hex") else ""))
+                             if name in ("send_text", "send_hex", "propose_rule") else ""))
         args = params.get("arguments") or {}
         if not isinstance(args, dict):
             raise _Params("arguments must be an object")
@@ -335,6 +396,7 @@ class McpServer:
             self._sessions[key] = shared
             self._known.add(key)
             client.on_device = lambda _d, s=shared, k=key: self._check(k, s)
+            client.on_trigger = lambda e, k=key: self._note_event(k, e)
             shared.level = client.health()["level"]
             return shared
 
@@ -497,6 +559,106 @@ class McpServer:
         if not isinstance(value, str):
             raise _Params("hex must be a string")
         return self._send_and_wait(args, lambda c: c.send_hex(value), value)
+
+
+    # ── triggers (S47) ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _when(args: dict) -> dict:
+        if args.get("hex"):
+            if not isinstance(args["hex"], str):
+                raise _Params("hex must be a string")
+            return {"hex": args["hex"]}
+        pattern = args.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            raise _Params("pattern (or hex) is required")
+        return {"regex" if args.get("regex") else "text": pattern}
+
+    @staticmethod
+    def _event_line(e: dict) -> str:
+        return f"#{e.get('seq')} [{e.get('wall')}] {e.get('name')}: {e.get('line')}"
+
+    def _watch_add(self, args: dict):
+        s = self._shared(args)
+        context = args.get("context", 3)
+        if not isinstance(context, int):
+            raise _Params("context must be an integer")
+        try:
+            wid = s.client.watch_add(self._when(args), name=str(args.get("name") or ""), context=context)
+        except SessionClientError as exc:
+            raise ToolError(f"watch refused: {exc}") from exc
+        return f"watching ({wid}); read_events or wait_for_event report it", {"id": wid}
+
+    def _watch_list(self, args: dict):
+        s = self._shared(args)
+        watches = [{"id": w["id"], "name": w["name"], "when": w["when"], "fired": w["fired"]}
+                   for w in s.client.watch_list()]
+        text = "\n".join(f"{w['id']}: {w['name']} {w['when']} (fired {w['fired']})" for w in watches)
+        return text or "(no watches)", {"watches": watches}
+
+    def _watch_remove(self, args: dict):
+        s = self._shared(args)
+        wid = args.get("id")
+        if not isinstance(wid, str):
+            raise _Params("id must be a string")
+        try:
+            s.client.watch_remove(wid)
+        except SessionClientError as exc:
+            raise ToolError(str(exc)) from exc
+        return f"removed {wid}", {"removed": wid}
+
+    def _read_events(self, args: dict):
+        s = self._shared(args)
+        events = s.client.events(since=s.events)[-MAX_LINES:]
+        if events:
+            s.events = int(events[-1].get("seq", s.events))
+            s.event_mark = max(s.event_mark, s.events)
+        text = "\n".join(self._event_line(e) for e in events) or "(no new events)"
+        return text, {"events": events, "_verdict": s.client.health()}
+
+    def _wait_for_event(self, args: dict):
+        s = self._shared(args)
+        timeout = self._timeout(args)
+        watch = args.get("watch")
+        # As wait_for: an event not yet handed back counts, even if it came first.
+        event = s.client.wait_event(timeout, watch=watch if isinstance(watch, str) else None,
+                                    since=max(s.events, s.event_mark))
+        if event is None:
+            raise ToolError(f"no event within {timeout:g}s")
+        s.event_mark = max(s.event_mark, int(event.get("seq", 0)))
+        context = "\n".join(f"  {line}" for line in event.get("context") or [])
+        text = self._event_line(event) + (f"\nbefore it:\n{context}" if context else "")
+        return text, {"event": event, "_verdict": s.client.health()}
+
+    def _propose_rule(self, args: dict):
+        s = self._shared(args)
+        if bool(args.get("send_text") is not None) == bool(args.get("send_hex")):
+            raise _Params("give send_text or send_hex")
+        action = ({"kind": "send", "text": str(args["send_text"]), "eol": args.get("eol", "cr")}
+                  if args.get("send_text") is not None else {"kind": "send", "hex": str(args["send_hex"])})
+        rule = {"name": str(args.get("name") or "rule"), "when": self._when(args),
+                "actions": [{"kind": "event"}, {"kind": "mark"}, action]}
+        try:
+            timeout = min(max(float(args.get("timeout", 120)), 0.0), MAX_PROPOSAL_WAIT)
+        except (TypeError, ValueError):
+            raise _Params("timeout must be a number")
+        try:
+            answer = s.client.propose_rule(rule, timeout=timeout)
+        except SessionClientError as exc:
+            raise ToolError(f"could not propose: {exc}") from exc
+        status = answer.get("status")
+        if status == "accepted":
+            return f"accepted: the rule is {answer.get('rule')}", {"status": status, "rule": answer.get("rule")}
+        reason = answer.get("reason") or {
+            "declined": "the person declined it",
+            "unanswered": "no answer in time"}.get(status, "")
+        raise ToolError(f"{status}: {reason}".rstrip(": "))
+
+    def _note_event(self, key: str, event: dict) -> None:
+        self._send({"jsonrpc": "2.0", "method": "notifications/message",
+                    "params": {"level": "notice", "logger": "uart-proxy",
+                               "data": {"session": key, "event": event.get("name"),
+                                        "seq": event.get("seq"), "line": event.get("line")}}})
 
 
 def cmd_mcp(args) -> int:

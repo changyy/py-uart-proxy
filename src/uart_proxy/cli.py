@@ -78,8 +78,9 @@ from .io.url_source import UrlSource, check_port_url, is_port_url
 from .ui.keymap import DEFAULT_PREFIX, normalise_prefix, prefix_label
 from .io.uart_source import UartSource
 from .plugins.manager import PluginManager
+from .core.triggers import Triggers
 from .proxy.protocol import Role, parse_auth_spec
-from .proxy.server import MAX_CLIENTS, ProxyServer
+from .proxy.server import MAX_CLIENTS, ProxyServer, TriggerPolicy
 
 
 # ── ports ─────────────────────────────────────────────────────────────────────
@@ -454,6 +455,26 @@ def session_footer(session: UartSession) -> str:
             f"{session.tracker.rel_window(end)}")
 
 
+def _build_triggers(session: UartSession, args: argparse.Namespace,
+                    recorder: Optional[Recorder]) -> Optional[Triggers]:
+    """S46: rules from --rules files; their events beside the recording."""
+    files = getattr(args, "rules", None) or []
+    if not files and not getattr(args, "serve", False):
+        return None
+    events_path = f"{recorder.raw_path[:-len('.log')]}-events.jsonl" if recorder is not None else None
+    triggers = Triggers(session, events_path=events_path)
+    approve = getattr(args, "approve_rules", False)
+    for path in files:
+        triggers.load(path, approve=approve)
+    if not files:
+        return triggers                      # serving: for the clients' watches (S47)
+    held = [r["name"] for r in triggers.list() if r["level"] and not r["enabled"]]
+    count = len(triggers.list())
+    print(f"Rules: {count} loaded" + (f"; {len(held)} that send are off — --approve-rules to let them act"
+                                      if held else ""), file=sys.stderr)
+    return triggers
+
+
 def _build_plugins(session: UartSession, args: argparse.Namespace) -> PluginManager:
     manager = PluginManager(session)
 
@@ -478,7 +499,8 @@ def _build_plugins(session: UartSession, args: argparse.Namespace) -> PluginMana
     return manager
 
 
-def _maybe_build_proxy(session: UartSession, args: argparse.Namespace) -> Optional[ProxyServer]:
+def _maybe_build_proxy(session: UartSession, args: argparse.Namespace,
+                       triggers: Optional[Triggers] = None) -> Optional[ProxyServer]:
     if not args.serve:
         return None
     auth: dict[str, Role] = {}
@@ -504,7 +526,11 @@ def _maybe_build_proxy(session: UartSession, args: argparse.Namespace) -> Option
     return ProxyServer(session, auth, host=args.listen, port=args.listen_port,
                        replay=replay if replay.enabled else None,
                        max_clients=getattr(args, "max_clients", MAX_CLIENTS),
-                       echo_tx=getattr(args, "echo_tx", False))
+                       echo_tx=getattr(args, "echo_tx", False),
+                       # S47: clients may watch, within --max-watches; nobody here
+                       # can be asked about a proposal, so none is accepted.
+                       triggers=triggers,
+                       trigger_policy=TriggerPolicy(max_watches=getattr(args, "max_watches", 3)))
 
 
 def attach_exclusivity_report(
@@ -850,7 +876,14 @@ def _run_session(
 
     recorder = _attach_recorder(session, args)
     plugins = _build_plugins(session, args)
-    proxy = _maybe_build_proxy(session, args)
+    try:
+        triggers = _build_triggers(session, args, recorder)
+    except (OSError, ValueError) as exc:
+        print(f"Error: --rules: {exc}", file=sys.stderr)
+        if recorder is not None:
+            close_recorder(recorder)
+        return 1
+    proxy = _maybe_build_proxy(session, args, triggers)
     mirrors = _maybe_build_pty_proxy(session, args)
 
     log_dir = os.path.normpath(os.path.dirname(recorder.raw_path)) if recorder is not None else None
@@ -927,6 +960,8 @@ def _run_session(
             proxy.stop()
         plugins.stop()
         session.stop()
+        if triggers is not None:
+            triggers.close()
         if recorder is not None:
             recorder.mark(session_footer(session))
             written = close_recorder(recorder)
@@ -1431,6 +1466,13 @@ def _add_common_io_args(p: argparse.ArgumentParser) -> None:
                    help="Load all plugins in a directory (repeatable).")
     p.add_argument("--plugin-config", metavar="JSON",
                    help="JSON file mapping plugin name -> config dict.")
+    # triggers (S46)
+    p.add_argument("--rules", action="append", metavar="FILE",
+                   help="Load trigger rules from a JSON file (repeatable): when the device "
+                        "says X, mark, notify or send Y. Rules that send stay off unless "
+                        "--approve-rules.")
+    p.add_argument("--approve-rules", action="store_true",
+                   help="Let the rules that send, as loaded from --rules, act.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1499,6 +1541,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Show proxy clients each line typed into the device "
                              "(by anyone). Off by default: that includes a "
                              "password typed at a login prompt.")
+    p_conn.add_argument("--max-watches", type=int, default=3, metavar="N",
+                        help="Watches each proxy client (an AI tool) may ask for "
+                             "(S47): they only report what they see. 0 = none. Default 3.")
     p_conn.add_argument("--max-clients", type=int, default=MAX_CLIENTS,
                         help=f"Proxy connections served at once; more are told "
                              f"to retry. 0 = no cap. Default {MAX_CLIENTS}.")
@@ -1605,6 +1650,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--echo-tx", action="store_true",
                          help="Show attached clients each line typed into the "
                               "device. Off by default (passwords are lines too).")
+    p_start.add_argument("--max-watches", type=int, default=3, metavar="N",
+                        help="Watches each proxy client (an AI tool) may ask for "
+                             "(S47): they only report what they see. 0 = none. Default 3.")
     p_start.add_argument("--max-clients", type=int, default=MAX_CLIENTS,
                          help=f"Proxy connections served at once. Default {MAX_CLIENTS}.")
     p_start.add_argument("--auth", action="append", metavar="CODE[:role]",

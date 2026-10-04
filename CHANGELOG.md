@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.20261004.1212247] — 2026-10-04
+
+When the device says X, do Y — as data, within limits, and with the person
+holding the key.
+
+### Added
+- **Triggers** (SPEC S46): rules that watch a session — a text or regular
+  expression in a line, a byte sequence, a silence, the device dropping or
+  coming back — and, within limits (once, cooldown, after n within a window,
+  at most 30 a minute), make an event, mark the line, notify, or send fixed
+  text or bytes. Events are kept, published on the bus and written beside
+  the recording (`<base>-events.jsonl`). `uart-proxy connect --rules FILE`;
+  a rule that sends acts only once approved (`--approve-rules`).
+  Safe by construction: no action runs a program or reaches the network,
+  nothing from a match is ever sent, regular expressions that nest
+  repetition are refused, and a rule cannot set itself off with its echo.
+- **Triggers through the proxy and MCP** (SPEC S47): a client may add a few
+  watches (`watch_add`, the owner's `max_watches`, default 3 —
+  `--max-watches`) that report `trigger` events, and a `full` client may
+  propose a rule that acts, which the owner decides (`TriggerPolicy(propose=…)`;
+  the CLI accepts none). MCP tools `watch_add`, `watch_list`,
+  `watch_remove`, `read_events`, `wait_for_event`, and `propose_rule` with
+  `--allow-send`; events also arrive as notifications.
+
 ## [1.20261004.1093657] — 2026-10-04
 
 An agent can tell whether the device is really there, and what would help.

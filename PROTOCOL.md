@@ -125,6 +125,11 @@ mode (e.g. a mobile viewer).
   (`%Y-%m-%d %H:%M:%S`); `elapsed` is seconds since the server session started.
   History is never sent as `rx` — see Replay above.
 - `seq` is a monotonically increasing counter.
+- `trigger` (optional, S47) — a rule of the session fired: `{"type":
+  "trigger", "seq", "rule", "name", "owner": {"kind", "client"}, "wall",
+  "elapsed", "line", "groups", "context", "mark", "notify", "actions"}`. Sent
+  to every client (each can read every line anyway). `seq` is the triggers'
+  own counter, not `rx`'s.
 
 ## Client → server (after auth)
 
@@ -146,6 +151,33 @@ mode (e.g. a mobile viewer).
   `telnet://`). Honoured from `full` clients only; the latest wins; ignored for a
   device that can't use it. A client sends it after authenticating and again on
   every resize.
+
+## Triggers (optional, S47)
+
+A client may ask the session to watch for something, and — with the `full`
+role — propose a rule that acts. What it may do is the session owner's
+policy, never the client's.
+
+```json
+{"type": "watch_add", "name": "kernel panic", "when": {"text": "panic"}, "context": 3}
+{"type": "watch_remove", "id": "r4"}
+{"type": "watch_list"}
+{"type": "rule_propose", "rule": {"name": "auto-login", "when": {"text": "login:"},
+                                  "actions": [{"kind": "send", "text": "root", "eol": "cr"}]}}
+```
+
+- `watch_add` → `{"type": "watch_ok", "id"}` or `{"type": "watch_fail",
+  "reason"}`. A watch only makes events: a message with `actions` is refused.
+  `when` is one of `text`, `regex`, `hex`, `silence` (seconds), `state`
+  (`connected`, `disconnected`, `reconnected`) — S46. At most the owner's
+  `max_watches` per connection (default 3); a client's watches end when it
+  disconnects, and every AI-made rule when the share stops.
+- `watch_remove` → `watch_ok` (only the client's own); `watch_list` →
+  `{"type": "watch_list", "watches": [...]}`.
+- `rule_propose` → `{"type": "proposal", "id", "status": "refused", "reason"}`
+  at once (read-only, no one to ask, an invalid or unsafe rule), or
+  `"status": "pending"`, then later `accepted` (with `rule`, its id) or
+  `declined`. The client stays served while the owner decides.
 
 ## Robustness expectations
 

@@ -17,6 +17,7 @@ seeing everything it sends and everything the device answers.
 
 from __future__ import annotations
 
+import queue
 import re
 import socket
 import threading
@@ -90,10 +91,18 @@ class SessionClient:
         self.device: dict = dict(_LEGACY_DEVICE)
         #: Called with the device dict whenever its state changes.
         self.on_device = None
+        #: Called with each trigger event (S47).
+        self.on_trigger = None
         self.link_error: Optional[str] = None
         self._heartbeat = heartbeat
         self._last_heard = time.monotonic()
         self._closing = False
+        # S47: replies to our requests, trigger events, proposals in the owner's hands.
+        self._replies: "queue.Queue[dict]" = queue.Queue()
+        self._request_lock = threading.Lock()
+        self._events: "deque[dict]" = deque(maxlen=500)
+        self._awaiting: set[str] = set()
+        self._decided: dict[str, dict] = {}
 
     # ── finding and joining a session ──────────────────────────────────────
 
@@ -332,8 +341,110 @@ class SessionClient:
         verdict = assess(shared=shared, device=device if shared else None, link_error=self.link_error)
         return {**verdict, "device": device, "share": {"connected": shared, "error": self.link_error}}
 
+    # ── triggers (S47) ─────────────────────────────────────────────────────
+
+    def _request(self, msg: dict, ok_type: str, timeout: float = 5.0) -> dict:
+        """Send ``msg`` and wait for its answer (``ok_type``, or a refusal)."""
+        with self._request_lock:
+            while not self._replies.empty():
+                self._replies.get_nowait()
+            self._send(msg)
+            deadline = time.monotonic() + timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise SessionClientError(f"no answer to {msg.get('type')}")
+                try:
+                    reply = self._replies.get(timeout=left)
+                except queue.Empty:
+                    continue
+                if reply.get("type") == "watch_fail":
+                    raise SessionClientError(str(reply.get("reason") or "refused"))
+                if reply.get("type") == ok_type:
+                    return reply
+
+    def watch_add(self, when: dict, *, name: str = "", limit: Optional[dict] = None,
+                  context: int = 3) -> str:
+        """Ask the session to tell us when ``when`` happens; returns the watch's id."""
+        msg: dict = {"type": "watch_add", "when": when, "name": name or "watch", "context": context}
+        if limit:
+            msg["limit"] = limit
+        return str(self._request(msg, "watch_ok")["id"])
+
+    def watch_remove(self, wid: str) -> None:
+        self._request({"type": "watch_remove", "id": wid}, "watch_ok")
+
+    def watch_list(self) -> list[dict]:
+        return list(self._request({"type": "watch_list"}, "watch_list").get("watches", []))
+
+    def propose_rule(self, rule: dict, timeout: float = 150.0) -> dict:
+        """Propose a rule that acts; the session's owner decides. Returns the
+        ``proposal`` answer: ``status`` refused, declined or accepted (``rule``)."""
+        first = self._request({"type": "rule_propose", "rule": rule}, "proposal")
+        if first.get("status") != "pending":
+            return first
+        pid = str(first.get("id"))
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while pid not in self._decided:
+                left = deadline - time.monotonic()
+                if left <= 0 or not self.connected:
+                    self._awaiting.discard(pid)
+                    return {"type": "proposal", "id": pid, "status": "unanswered"}
+                self._cond.wait(min(left, 0.5))
+            self._awaiting.discard(pid)
+            return self._decided.pop(pid)
+
+    def events(self, since: int = 0) -> list[dict]:
+        """The trigger events heard, after ``since`` (an event's ``seq``)."""
+        with self._cond:
+            return [dict(e) for e in self._events if int(e.get("seq", 0)) > since]
+
+    def wait_event(self, timeout: float = 10.0, *, watch: Optional[str] = None,
+                   since: Optional[int] = None) -> Optional[dict]:
+        """The next trigger event (of ``watch``, if given) after ``since`` —
+        by default, from the moment of the call; ``None`` on timeout."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            if since is None:
+                since = max((int(e.get("seq", 0)) for e in self._events), default=0)
+            while True:
+                for event in self._events:
+                    if int(event.get("seq", 0)) > since and (watch is None or event.get("rule") == watch):
+                        return dict(event)
+                left = deadline - time.monotonic()
+                if left <= 0 or not self.connected:
+                    return None
+                self._cond.wait(min(left, 0.5))
+
     def _handle(self, msg: dict) -> None:
         kind = msg.get("type")
+        if kind in ("watch_ok", "watch_fail", "watch_list"):
+            self._replies.put(msg)
+            return
+        if kind == "proposal":
+            pid = str(msg.get("id"))
+            with self._cond:
+                if msg.get("status") == "pending":
+                    self._awaiting.add(pid)
+                elif pid in self._awaiting:
+                    self._decided[pid] = msg
+                    self._cond.notify_all()
+                    return
+            self._replies.put(msg)
+            return
+        if kind == "trigger":
+            event = {k: v for k, v in msg.items() if k != "type"}
+            with self._cond:
+                self._events.append(event)
+                self._cond.notify_all()
+            callback = self.on_trigger
+            if callback is not None:
+                try:
+                    callback(dict(event))
+                except Exception:  # noqa: BLE001 - a listener's bug is not the link's
+                    pass
+            return
         if kind == "replay":
             self._add(str(msg.get("text", "")), msg, replayed=True)
         elif kind == "rx":
