@@ -722,8 +722,11 @@ the fix is almost always one command away.
   error as a `UARTError`, so `is_busy_error` walks the cause chain for
   `errno == EBUSY` (or its text). On Windows a COM port held elsewhere fails
   with "Access is denied", which `uart_helper` files as a permission error; a COM
-  port has no permission bits, so there it counts as busy. An absent device or a
-  real permission problem is not busy.
+  port has no permission bits, so there it counts as busy. That text is
+  translated on a Windows set to another language, so it is recognised by its
+  codes, which are not: `winerror` 5, or pyserial's message
+  `PermissionError(13, '<any text>', None, 5)`. An absent device or a real
+  permission problem is not busy.
 - **Naming the holder**, best-effort, in this order:
   1. a **registered background session** — its pid among `lsof`'s holders, or,
      when `lsof` is missing or cannot see the pid, a live state file whose

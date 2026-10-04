@@ -85,6 +85,17 @@ def test_a_permission_problem_is_not_busy_on_posix(monkeypatch):
     assert not is_busy_error(_wrapped(cause, UARTPermissionError))
 
 
+def test_access_denied_in_another_language_is_still_busy_on_windows(monkeypatch):
+    """The text is translated (here Traditional Chinese); the codes are not."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    cause = serial.SerialException(
+        "could not open port 'COM6': PermissionError(13, '存取被拒。', None, 5)")
+    assert is_busy_error(_wrapped(cause, UARTPermissionError))
+    denied = PermissionError(13, "存取被拒。")
+    denied.winerror = 5
+    assert is_busy_error(denied)
+
+
 def test_access_denied_on_windows_means_the_com_port_is_taken(monkeypatch):
     """A COM port has no permission bits; 'Access is denied' is another opener."""
     monkeypatch.setattr(sys, "platform", "win32")

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,9 @@ from .daemon import DaemonInfo, list_daemons
 #: ``lsof`` walks every open file on the machine; on a busy one that can take a
 #: while. A hint that arrives late is worth less than none, so give up quickly.
 LSOF_TIMEOUT = 2.0
+
+
+_WIN_DENIED = re.compile(r"permissionerror\(13,.*,\s*none,\s*5\)")
 
 
 def is_busy_error(exc: BaseException) -> bool:
@@ -52,8 +56,13 @@ def is_busy_error(exc: BaseException) -> bool:
         text = str(current).lower()
         if "resource busy" in text or f"errno {errno.EBUSY}]" in text:
             return True
-        if sys.platform == "win32" and "access is denied" in text:
-            return True
+        if sys.platform == "win32":
+            # The message is translated; the codes are not: ERROR_ACCESS_DENIED
+            # (winerror 5), and pyserial's "PermissionError(13, '…', None, 5)".
+            if "access is denied" in text or getattr(current, "winerror", None) == 5:
+                return True
+            if _WIN_DENIED.search(text):
+                return True
         current = current.__cause__ or current.__context__
     return False
 

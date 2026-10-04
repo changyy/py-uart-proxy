@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **A COM port held elsewhere was not "busy" on a Windows in another
+  language.** "Access is denied" is translated there; it is now recognised by
+  its codes (`winerror` 5, pyserial's `PermissionError(13, …, None, 5)`), so
+  the busy hint (S21) names the holder and how to join it.
+
 ## [1.20261004.1221145] — 2026-10-04
 
 When the device says X, do Y — as data, within limits, and with the person
