@@ -21,6 +21,7 @@ import itertools
 import logging
 import threading
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
 from ..io.source import SourceRefused
@@ -58,6 +59,15 @@ class UartSession:
         self.default_eol = default_eol
         self.auto_reconnect = auto_reconnect
         self.reconnect_interval = reconnect_interval
+        # S43: the device's health — its last published state, since when,
+        # with what error; how often it came back; when it last spoke.
+        self._health_lock = threading.Lock()
+        self._device_state = "connecting"
+        self._device_since = datetime.now()
+        self._device_error: Optional[str] = None
+        self._reconnects = 0
+        self._ever_connected = False
+        self._last_output: Optional[datetime] = None
 
         self._rx_asm = LineAssembler()
         # What is typed ends a line on Enter, and Enter is often a bare \r.
@@ -196,6 +206,7 @@ class UartSession:
 
     def _on_rx(self, data: bytes) -> None:
         self.rx_bytes += len(data)
+        self._last_output = datetime.now()
         stamp = self.tracker.stamp()
         self._emit(
             Event(
@@ -267,7 +278,30 @@ class UartSession:
         if raw is not None:
             self._emit_line(raw, direction)
 
+    def device_health(self) -> dict:
+        """S43: the device's state, since when, its error, reconnects, last output."""
+        with self._health_lock:
+            return {"state": self._device_state,
+                    "since": self._device_since.strftime("%Y-%m-%d %H:%M:%S"),
+                    "since_epoch": self._device_since.timestamp(),
+                    "error": self._device_error,
+                    "reconnects": self._reconnects,
+                    "last_output": (self._last_output.strftime("%Y-%m-%d %H:%M:%S")
+                                    if self._last_output else None),
+                    "last_output_epoch": self._last_output.timestamp() if self._last_output else None}
+
     def _publish_status(self, state: str, meta: dict) -> None:
+        with self._health_lock:
+            if state == "connected":
+                if self._ever_connected:
+                    self._reconnects += 1
+                self._ever_connected = True
+                self._device_error = None
+            elif "error" in meta:
+                self._device_error = str(meta["error"])
+            if state != self._device_state or state == "connected":
+                self._device_since = datetime.now()
+            self._device_state = state
         self._emit(
             Event(
                 kind=EventKind.STATUS,

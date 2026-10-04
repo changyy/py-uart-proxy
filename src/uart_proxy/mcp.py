@@ -15,12 +15,14 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from datetime import datetime
 from typing import Any, Callable, Optional
 
 from ._version import __version__
 from .client import ReadOnlyError, SessionClient, SessionClientError, format_line
 from .core.daemon import DaemonNotFound, list_daemons, prune_dead
+from .health import assess
 from .proxy.protocol import Role
 
 #: Protocol versions this server speaks (the tools subset is the same in each).
@@ -29,6 +31,10 @@ NEWEST_KNOWN = "2025-06-18"
 MAX_LINES = 200
 MAX_CHARS = 20_000
 MAX_TIMEOUT = 120.0
+MAX_DEVICE_WAIT = 600.0
+#: How often an attached session's health is looked at, for notifications (S44).
+WATCH_SECONDS = 0.5
+_NOTE_LEVEL = {"down": "warning", "degraded": "notice", "ok": "info"}
 
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS = -32700, -32600, -32601, -32602
 
@@ -36,6 +42,8 @@ INSTRUCTIONS = (
     "Serial sessions that a person shares with you, from UARTist or uart-proxy. "
     "Start with list_sessions, then tail to see where the device is. read_new returns "
     "only what you have not seen; wait_for waits for output you have not seen yet. "
+    "session_status says whether the device is there; when it is not, tell the person what "
+    "its advice says (re-plug the adapter, share the tab again) and call wait_for_device. "
     "The person watching the session sees everything you send. Ask before sending "
     "anything that could change the device irreversibly (bootloader, erase, flash, "
     "factory reset, reboot loops)."
@@ -88,6 +96,14 @@ READ_TOOLS = [
          "session": _session_arg(),
          "pattern": {"type": "string", "description": "A regular expression (Python syntax)."},
          "timeout": _timeout_arg(10)}}},
+    {"name": "wait_for_device", "title": "Wait for the device",
+     "description": "Wait until the session is shared and its device connected — for example after "
+                    "asking the person to re-plug the adapter or share the tab again. Returns the "
+                    "session's health.",
+     "inputSchema": {"type": "object", "properties": {
+         "session": _session_arg(),
+         "timeout": {"type": "number", "minimum": 0, "maximum": MAX_DEVICE_WAIT,
+                     "description": f"Seconds to wait (default 60, at most {MAX_DEVICE_WAIT:g})."}}}},
 ]
 
 SEND_TOOLS = [
@@ -144,6 +160,7 @@ class _Shared:
         self.client = client
         self.cursor = 0          # read_new: lines up to here were returned
         self.mark = 0            # wait_for: matched or returned up to here
+        self.level: Optional[str] = None   # the verdict last notified (S44)
 
 
 class McpServer:
@@ -162,7 +179,10 @@ class McpServer:
         self._handlers = {
             "list_sessions": self._list_sessions, "session_status": self._status,
             "read_new": self._read_new, "tail": self._tail, "wait_for": self._wait_for,
+            "wait_for_device": self._wait_for_device,
         }
+        self._known: set[str] = set()       # sessions attached to before (S44)
+        threading.Thread(target=self._watch, daemon=True, name="mcp-health").start()
         if allow_send:
             self._handlers.update(send_text=self._send_text, send_hex=self._send_hex)
 
@@ -237,7 +257,7 @@ class McpServer:
         try:
             if method == "initialize":
                 self._reply(mid, self._initialize(params))
-            elif method == "ping":
+            elif method in ("ping", "logging/setLevel"):
                 self._reply(mid, {})
             elif method == "tools/list":
                 self._reply(mid, {"tools": self.tools})
@@ -258,7 +278,7 @@ class McpServer:
         asked = params.get("protocolVersion")
         return {
             "protocolVersion": asked if asked in KNOWN_VERSIONS else NEWEST_KNOWN,
-            "capabilities": {"tools": {"listChanged": False}},
+            "capabilities": {"tools": {"listChanged": False}, "logging": {}},
             "serverInfo": {"name": "uart-proxy", "title": "uart-proxy serial sessions",
                            "version": __version__},
             "instructions": INSTRUCTIONS,
@@ -276,10 +296,15 @@ class McpServer:
             raise _Params("arguments must be an object")
         try:
             text, data = handler(args)
-            return {"content": [{"type": "text", "text": text}], "structuredContent": data,
-                    "isError": False}
         except ToolError as exc:
             return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+        verdict = data.pop("_verdict", None)
+        if verdict is not None and verdict["level"] != "ok":
+            # S44: a result from a session that is not well says so, first.
+            data["health"] = {"level": verdict["level"], "summary": verdict["summary"],
+                              "advice": verdict["advice"]}
+            text = f"⚠ {verdict['summary']} {verdict['advice']}".rstrip() + "\n" + text
+        return {"content": [{"type": "text", "text": text}], "structuredContent": data, "isError": False}
 
     # ── sessions ───────────────────────────────────────────────────────────
 
@@ -292,6 +317,10 @@ class McpServer:
             client = SessionClient.from_registry(name, want_full=self.allow_send,
                                                  client_name=self.client_name)
         except DaemonNotFound as exc:
+            gone = (name or (next(iter(self._known)) if len(self._known) == 1 else None))
+            if gone in self._known:
+                verdict = assess(shared=False, device=None, link_error="it is no longer listed")
+                raise ToolError(f"{gone}: {verdict['summary']} {verdict['advice']}") from exc
             raise ToolError(str(exc)) from exc
         key = client.name
         with self._sessions_lock:
@@ -304,6 +333,9 @@ class McpServer:
                 raise ToolError(f"cannot reach session {key!r}: {exc}") from exc
             shared = _Shared(client)
             self._sessions[key] = shared
+            self._known.add(key)
+            client.on_device = lambda _d, s=shared, k=key: self._check(k, s)
+            shared.level = client.health()["level"]
             return shared
 
     @staticmethod
@@ -335,13 +367,18 @@ class McpServer:
         s = self._shared(args)
         c = s.client
         access = "read & send" if self.allow_send and c.role == Role.FULL else "read-only"
-        last = (datetime.fromtimestamp(c.last_activity).isoformat(timespec="seconds")
-                if c.last_activity else None)
-        data = {"session": c.name, "source": c.source, "device": c.state,
-                "connected": c.connected, "access": access, "lines": c.cursor,
-                "last_output": last}
-        text = (f"{c.name}: {c.source} — device {c.state}, {access}, {c.cursor} lines"
-                + (f", last output {last}" if last else ""))
+        v = c.health()
+        dev = v["device"]
+        device = {k: dev.get(k) for k in ("state", "since", "error", "reconnects", "last_output")}
+        device["silent_for"] = round(dev["silent_for"], 1) if dev.get("silent_for") is not None else None
+        data = {"session": c.name, "source": c.source, "health": v["level"], "summary": v["summary"],
+                "advice": v["advice"], "access": access, "lines": c.cursor, "connected": c.connected,
+                "share": v["share"], "device": device}
+        text = (f"{c.name}: {v['level'].upper()} — {v['summary']}"
+                + (f" {v['advice']}" if v["advice"] else "")
+                + f"\nsource {c.source}; {access}; {c.cursor} lines; device {device['state']}"
+                + (f" since {device['since']}" if device.get("since") else "")
+                + (f", {device['reconnects']} reconnects" if device.get("reconnects") else ""))
         return text, data
 
     def _read_new(self, args: dict):
@@ -352,7 +389,7 @@ class McpServer:
         partial = s.client.partial
         shown, hidden = _bounded(lines, dropped)
         text = _render(shown + ([partial] if partial else []), hidden)
-        return text, {"lines": shown, "partial": partial, "not_shown": hidden}
+        return text, {"lines": shown, "partial": partial, "not_shown": hidden, "_verdict": s.client.health()}
 
     def _tail(self, args: dict):
         s = self._shared(args)
@@ -364,7 +401,7 @@ class McpServer:
         partial = s.client.partial
         shown, hidden = _bounded(lines)
         return _render(shown + ([partial] if partial else []), hidden), \
-            {"lines": shown, "partial": partial}
+            {"lines": shown, "partial": partial, "_verdict": s.client.health()}
 
     def _wait(self, s: _Shared, pattern, timeout: float, since: int):
         if not isinstance(pattern, str) or not pattern:
@@ -375,16 +412,61 @@ class McpServer:
             raise ToolError(f"bad pattern {pattern!r}: {exc}") from exc
         if hit is None:
             seen = s.client.tail(5)
-            raise ToolError(f"no output matching {pattern!r} within {timeout:g}s. "
+            v = s.client.health()
+            why = (f"{v['summary']} {v['advice']}".strip() if v["level"] != "ok" or v["advice"]
+                   else "The device is connected.")
+            raise ToolError(f"no output matching {pattern!r} within {timeout:g}s. {why}\n"
                             f"Last lines:\n" + _render(seen, 0))
         line = hit["line"]
         s.mark = max(s.mark, line["n"] if not line.get("partial") else s.client.cursor)
         text = _render(hit["before"] + [line], 0, head=f"matched {pattern!r}:")
-        return text, {"match": line, "before": hit["before"]}
+        return text, {"match": line, "before": hit["before"], "_verdict": s.client.health()}
 
     def _wait_for(self, args: dict):
         s = self._shared(args)
         return self._wait(s, args.get("pattern"), self._timeout(args), max(s.mark, s.cursor))
+
+    def _wait_for_device(self, args: dict):
+        try:
+            timeout = min(max(float(args.get("timeout", 60)), 0.0), MAX_DEVICE_WAIT)
+        except (TypeError, ValueError):
+            raise _Params("timeout must be a number")
+        deadline = time.monotonic() + timeout
+        last: Optional[str] = None
+        while True:
+            try:
+                s = self._shared(args)          # joins again if it was shared anew
+                v = s.client.health()
+                if s.client.connected and v["device"].get("state") == "connected":
+                    text, data = self._status(args)
+                    return f"The device is back.\n{text}", data
+                last = f"{v['summary']} {v['advice']}".strip()
+            except ToolError as exc:
+                last = str(exc)
+            if time.monotonic() >= deadline:
+                raise ToolError(f"still not back after {timeout:g}s. {last}")
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    # ── notifications (S44) ─────────────────────────────────────────────────
+
+    def _watch(self) -> None:
+        """Re-look at attached sessions: a verdict also changes with time (settling)."""
+        while True:
+            time.sleep(WATCH_SECONDS)
+            with self._sessions_lock:
+                shared = list(self._sessions.items())
+            for key, s in shared:
+                self._check(key, s)
+
+    def _check(self, key: str, s: "_Shared") -> None:
+        v = s.client.health()
+        if v["level"] == s.level:
+            return
+        s.level = v["level"]
+        self._send({"jsonrpc": "2.0", "method": "notifications/message",
+                    "params": {"level": _NOTE_LEVEL[v["level"]], "logger": "uart-proxy",
+                               "data": {"session": key, "health": v["level"],
+                                        "summary": v["summary"], "advice": v["advice"]}}})
 
     def _send_and_wait(self, args: dict, send: Callable[[SessionClient], None], what: str):
         s = self._shared(args)

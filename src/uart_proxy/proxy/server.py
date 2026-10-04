@@ -55,6 +55,12 @@ FAIL_WINDOW = 60.0
 BAN_SECONDS = 600.0
 
 
+def _wire_health(h: dict) -> dict:
+    """The device's health as sent: its state, since when, error, reconnects, last output."""
+    return {k: h[k] for k in ("state", "since", "since_epoch", "error", "reconnects",
+                              "last_output", "last_output_epoch")}
+
+
 class AuthLimiter:
     """Counts failed auth attempts per address and refuses repeat offenders."""
 
@@ -115,6 +121,8 @@ class _Client:
         #: The name the client gave itself (``auth.client``), if any (S40).
         self.name = ""
         self.connected_at = time.time()
+        #: The last message from this client, pings included (S45).
+        self.last_seen = self.connected_at
         self.send_q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=_SEND_QUEUE_MAX)
         self._recv_buf = bytearray()
         self.writer_thread: Optional[threading.Thread] = None
@@ -261,7 +269,8 @@ class ProxyServer:
         with self._clients_lock:
             clients = sorted(self._clients, key=lambda c: c.connected_at)
         return [{"address": self._endpoint(c), "role": c.role.value if c.role else "",
-                 "client": c.name, "connected_at": c.connected_at} for c in clients]
+                 "client": c.name, "connected_at": c.connected_at, "last_seen": c.last_seen}
+                for c in clients]
 
     @staticmethod
     def _endpoint(client: "_Client") -> str:
@@ -391,6 +400,8 @@ class ProxyServer:
                     # Where this session is on its own clock, so a client can
                     # adopt our timeline instead of starting a second one.
                     "elapsed": round(self.session.tracker.stamp().elapsed, 4),
+                    # S43: the device's state now, so a client never assumes it.
+                    "device": _wire_health(self.session.device_health()),
                 },
             )
             self._send_replay(client, msg.get("replay"))
@@ -438,6 +449,7 @@ class ProxyServer:
         for line in client.read_lines():
             if not line.strip():
                 continue
+            client.last_seen = time.time()
             try:
                 msg = decode_message(line)
             except ValueError:
@@ -504,6 +516,10 @@ class ProxyServer:
 
     def _on_event(self, event: Event) -> None:
         msg = self._serialize(event)
+        if msg is not None and msg["type"] == "status":
+            h = self.session.device_health()     # already updated for this status (S43)
+            msg.update(since=h["since"], since_epoch=h["since_epoch"], reconnects=h["reconnects"],
+                       error=h["error"])
         skip = None
         if msg is None and self.echo_tx and event.kind == EventKind.LINE \
                 and event.direction == Direction.TX:
@@ -542,7 +558,7 @@ class ProxyServer:
         if event.kind == EventKind.NOTICE:
             return {"type": "notice", "text": event.text, "meta": event.meta}
         if event.kind == EventKind.STATUS:
-            return {"type": "status", "state": event.text, "meta": event.meta}
+            return {"type": "status", "state": event.text, "meta": event.meta}  # since/reconnects added in _on_event
         return None
 
     def _send_now(self, client: _Client, msg: dict) -> None:

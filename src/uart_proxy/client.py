@@ -28,6 +28,7 @@ from .core.daemon import connect_host, find_daemon
 from .core.line_assembler import LineAssembler
 from .core.text import clean_text
 from .core.timestamp import format_elapsed
+from .health import assess
 from .proxy.protocol import EOL_MAP, Role, decode_message, encode_message
 
 #: Lines kept, oldest dropped (and counted) beyond this.
@@ -36,6 +37,11 @@ DEFAULT_MAX_LINES = 10_000
 DEFAULT_REPLAY = 500
 #: How many lines before a match ``expect`` hands back, for context.
 CONTEXT_LINES = 5
+#: Seconds between pings; three without a word back is a lost link (S43).
+DEFAULT_HEARTBEAT = 5.0
+#: A server from before S43 sends no device state: it was taken as connected.
+_LEGACY_DEVICE = {"state": "connected", "since": None, "since_epoch": None, "error": None,
+                  "reconnects": 0, "last_output": None, "last_output_epoch": None}
 
 
 class SessionClientError(Exception):
@@ -57,7 +63,8 @@ def _hex_bytes(text: str) -> bytes:
 class SessionClient:
     def __init__(self, host: str, port: int, code: str, *, client_name: str = "",
                  replay: int = DEFAULT_REPLAY, max_lines: int = DEFAULT_MAX_LINES,
-                 connect_timeout: float = 5.0, name: str = "") -> None:
+                 connect_timeout: float = 5.0, name: str = "",
+                 heartbeat: float = DEFAULT_HEARTBEAT) -> None:
         self.host, self.port, self.code = host, port, code
         self.client_name = client_name
         #: The registry name, when it came from there.
@@ -79,6 +86,14 @@ class SessionClient:
         self.connected = False
         self.error: Optional[str] = None
         self.last_activity: Optional[float] = None
+        # S43: the device as the session last described it, and our own link.
+        self.device: dict = dict(_LEGACY_DEVICE)
+        #: Called with the device dict whenever its state changes.
+        self.on_device = None
+        self.link_error: Optional[str] = None
+        self._heartbeat = heartbeat
+        self._last_heard = time.monotonic()
+        self._closing = False
 
     # ── finding and joining a session ──────────────────────────────────────
 
@@ -117,7 +132,12 @@ class SessionClient:
             raise SessionClientError(f"refused: {msg.get('reason', 'unknown')}")
         self.role = Role(msg.get("role", "readonly"))
         self.source = str(msg.get("source", ""))
+        if isinstance(msg.get("device"), dict):
+            self.device = {**_LEGACY_DEVICE, **msg["device"]}
+            self.state = self.device["state"]
         self.connected = True
+        self.link_error = None
+        self._last_heard = time.monotonic()
         # The replay block (S18) comes before any live traffic, ending in
         # replay_end — read it here so it is in hand when connect() returns.
         if self._replay > 0:
@@ -134,8 +154,11 @@ class SessionClient:
         self._reader = threading.Thread(target=self._read_loop, args=(buf,), daemon=True,
                                         name=f"session-client-{self.port}")
         self._reader.start()
+        if self._heartbeat > 0:
+            threading.Thread(target=self._beat, daemon=True, name=f"session-heartbeat-{self.port}").start()
 
     def close(self) -> None:
+        self._closing = True
         sock, self._sock = self._sock, None
         if sock is not None:
             try:
@@ -258,14 +281,56 @@ class SessionClient:
                 line = self._read_line(buf)
                 if line is None:
                     break
+                self._last_heard = time.monotonic()
                 try:
                     self._handle(decode_message(line))
                 except ValueError:
                     continue
         finally:
             with self._cond:
+                if not self._closing and self.link_error is None:
+                    self.link_error = "the session closed the connection"
                 self.connected = False
                 self._cond.notify_all()
+
+    def _beat(self) -> None:
+        """Ping, and count the link lost when nothing has come back for three beats."""
+        while self.connected and not self._closing:
+            time.sleep(self._heartbeat)
+            if not self.connected or self._closing:
+                return
+            if time.monotonic() - self._last_heard > 3 * self._heartbeat:
+                self.link_error = "no answer from the session"
+                sock, self._sock = self._sock, None
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    sock.close()
+                with self._cond:
+                    self.connected = False
+                    self._cond.notify_all()
+                return
+            try:
+                self._send({"type": "ping"})
+            except (OSError, SessionClientError):
+                pass
+
+    # ── health (S43) ───────────────────────────────────────────────────────
+
+    def health(self) -> dict:
+        """The verdict on this session: link and device, with advice."""
+        now = time.time()
+        with self._cond:
+            device = dict(self.device)
+            shared = self.connected
+        since = device.get("since_epoch")
+        last = device.get("last_output_epoch")
+        device["since_age"] = (now - since) if since else None
+        device["silent_for"] = (now - last) if last else None
+        verdict = assess(shared=shared, device=device if shared else None, link_error=self.link_error)
+        return {**verdict, "device": device, "share": {"connected": shared, "error": self.link_error}}
 
     def _handle(self, msg: dict) -> None:
         kind = msg.get("type")
@@ -281,6 +346,8 @@ class SessionClient:
             for raw in lines:
                 self._add(raw.decode("utf-8", errors="replace"), msg)
             with self._cond:
+                self.device["last_output"] = str(msg.get("wall", "")) or self.device.get("last_output")
+                self.device["last_output_epoch"] = time.time()
                 pending = self._asm.pending
                 self._partial = (self._line(pending.decode("utf-8", errors="replace"), msg,
                                             n=self._last_n + 1, partial=True) if pending else None)
@@ -290,7 +357,20 @@ class SessionClient:
         elif kind == "status":
             with self._cond:
                 self.state = str(msg.get("state", self.state))
+                self.device["state"] = self.state
+                for key in ("since", "since_epoch", "reconnects"):
+                    if key in msg:
+                        self.device[key] = msg[key]
+                if "error" in msg:
+                    self.device["error"] = msg["error"]
+                device = dict(self.device)
                 self._cond.notify_all()
+            callback = self.on_device
+            if callback is not None:
+                try:
+                    callback(device)
+                except Exception:  # noqa: BLE001 - a listener's bug is not the link's
+                    pass
 
     @staticmethod
     def _line(text: str, msg: dict, *, n: int, replayed: bool = False,

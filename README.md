@@ -125,6 +125,11 @@ in a temporary `UART_PROXY_HOME`.
 
 ## Usage
 
+
+Before a push, the tests run by themselves once the repository's hooks are
+enabled: `git config core.hooksPath .githooks` (a failing test stops the
+push; `git push --no-verify` skips it).
+
 ### 1. List ports
 
 ```bash
@@ -989,7 +994,15 @@ code. In Claude Desktop's `claude_desktop_config.json`:
 }
 ```
 
-or with Claude Code: `claude mcp add uart -- uart-proxy mcp`. Add
+or with Claude Code: `claude mcp add uart -- uart-proxy mcp`.
+
+The agent always knows whether the device is really there: `session_status`
+gives a verdict — `ok`, `degraded` (just reconnected, or connecting) or `down`
+(the adapter is gone, or the session is no longer shared) — with advice a
+person can act on ("re-plug the USB-serial adapter", "share the tab again").
+Results from a session that is not well say so first; `wait_for_device` waits
+for it to come back after the person re-plugs it; and a change of the verdict
+is sent as an MCP notification. Add
 `--allow-send` to the arguments to let the agent type. The agent connects
 under the name `uart-proxy mcp (<its name>)`, which the session's owner sees.
 

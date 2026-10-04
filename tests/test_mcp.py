@@ -41,19 +41,29 @@ def _wait_for(predicate, timeout=3.0):
 class Mcp:
     """One `uart-proxy mcp` process, and JSON-RPC over its stdin/stdout."""
 
-    def __init__(self, *args):
+    def __init__(self, *args, env=None):
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uart_proxy", "mcp", *args],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=os.environ.copy(),
+            env={**os.environ, **(env or {})},
         )
         self.lines: "queue.Queue[bytes]" = queue.Queue()
+        #: Notifications (S44) arrive between replies; kept apart, in order.
+        self.notes: "queue.Queue[dict]" = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
         self._id = 0
 
     def _pump(self):
         for line in self.proc.stdout:
-            self.lines.put(line)
+            try:
+                msg = json.loads(line.decode("utf-8"))
+            except ValueError:
+                self.lines.put(line)       # not JSON: recv() will fail on it, as it should
+                continue
+            if "method" in msg and "id" not in msg:
+                self.notes.put(msg)
+            else:
+                self.lines.put(line)
 
     def send_raw(self, raw: bytes):
         self.proc.stdin.write(raw)
@@ -99,16 +109,17 @@ class Mcp:
 def served():
     made = []
 
-    def _make(*, echo=False, history=b"", codes=None):
-        device = FakeSource(echo=echo)
-        session = UartSession(device)
+    def _make(*, echo=False, history=b"", codes=None, absent=False):
+        device = FakeSource(echo=echo, fail_opens=10_000 if absent else 0)
+        session = UartSession(device, reconnect_interval=0.1)
         replay = ReplayBuffer(100)
         session.bus.subscribe(replay.handle)
         server = ProxyServer(session, codes or {"rw": Role.FULL, "ro": Role.READONLY},
                              host="127.0.0.1", port=0, replay=replay)
         server.start()
         session.start()
-        assert _wait_for(lambda: session.is_connected)
+        if not absent:
+            assert _wait_for(lambda: session.is_connected)
         if history:
             device.feed(history)
             assert _wait_for(lambda: len(replay) >= history.count(b"\n"))
@@ -127,8 +138,8 @@ def served():
 def mcp():
     made = []
 
-    def _make(*args):
-        m = Mcp(*args)
+    def _make(*args, env=None):
+        m = Mcp(*args, env=env)
         made.append(m)
         return m
 
@@ -160,7 +171,7 @@ def test_s42_send_tools_exist_only_with_allow_send(mcp):
     read_only = mcp()
     read_only.start()
     names = {t["name"] for t in read_only.call("tools/list")["result"]["tools"]}
-    assert names == {"list_sessions", "session_status", "read_new", "tail", "wait_for"}
+    assert names == {"list_sessions", "session_status", "read_new", "tail", "wait_for", "wait_for_device"}
     allowed = mcp("--allow-send")
     allowed.start()
     tools = allowed.call("tools/list")["result"]["tools"]

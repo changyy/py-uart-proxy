@@ -148,6 +148,8 @@ The seven original requirements, implemented end to end.
   who-sent-it on TX, `SessionClient` + `tail` / `expect` / `send`, and
   `uart-proxy mcp` — an MCP server that reads a shared session and, with
   `--allow-send` and a full-access code, types into it.
+  - ✅ Health (SPEC S43–S45): device state on attach, heartbeats, one verdict
+    with advice, `wait_for_device`, notifications, clients' last activity.
   - ⬜ Ask before each send: a hook the session's owner answers (an app shows
     the bytes, Allow / Deny).
   - 💡 Byte-level tools (hex frames with timing) for binary protocols.

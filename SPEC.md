@@ -1404,3 +1404,81 @@ application embedding the proxy) stays where a person can watch it.
   with a full code it reaches the device and `wait_for` returns the echo.
 - Bad JSON and unknown methods get JSON-RPC errors, and the server keeps
   serving; stdout carries only JSON-RPC lines.
+
+## S43. Device health, on the wire and in the client
+
+An agent working through a shared session (S42) must know whether the device
+is really there — and must not assume it is because nobody said otherwise. A
+client used to learn the device's state only when it *changed*; one that
+attached during a drop believed it connected.
+
+- The session keeps its **device state** — the last status it published
+  (`connecting`, `connected`, `waiting`, `reconnecting`, `error`,
+  `disconnected`) — with when it began (`since`, local wall time), the error
+  that came with it, how many times it has **reconnected** (connected again
+  after a first connection), and when the device last said anything
+  (`last_output`). `UartSession.device_health()` returns them.
+- **On the wire** (optional fields, PROTOCOL.md): `auth_ok` carries `device`
+  — that snapshot — so a client knows the state the moment it attaches; every
+  `status` message carries `since` and `reconnects`.
+- **The session client** (S41) keeps the snapshot current from `auth_ok`,
+  `status` and `rx`, and watches its own link: it pings every few seconds and
+  counts the link lost when nothing at all has come back for three intervals
+  (a half-open socket), as well as on a close.
+- `uart_proxy.health.assess(…)` turns the two into one verdict:
+  - **down** — the session is no longer shared or reachable; or the device is
+    `waiting` (absent), `error` / `reconnecting` (dropped) or `disconnected`;
+  - **degraded** — `connecting`, or connected again less than 60 s ago (output
+    from the gap may be missing);
+  - **ok** — connected and settled.
+  Each comes with **advice** a person can act on: re-plug the adapter, check
+  the cable, share the tab again; and, when the device has been silent for a
+  minute, that this is normal for an idle console but that a device which
+  should be talking may need a reset.
+
+**Acceptance**
+- A client attaching while the device is absent sees `waiting` and its error
+  at once; one attaching while connected sees `connected` with `since`.
+- A drop and a return: the client sees `error`/`reconnecting`, then
+  `connected` with `reconnects` 1; for 60 s that is `degraded`, then `ok`.
+- A server that stops answering (no pong, no traffic) is a lost link within
+  three heartbeats; the verdict is `down` with advice to share again.
+- `assess` covers each state above with its level and advice, and names the
+  silence only past a minute.
+
+## S44. Health through MCP
+
+- `session_status` returns the verdict and each link: `share` (the MCP
+  server's connection to the session) and `device` (S43), with `advice`.
+- Every tool that reads or sends adds the verdict to its result when it is
+  not `ok`, and a `wait_for` that times out says whether the device was
+  there and how long it had been silent — so an agent can tell "no answer"
+  from "nobody to answer".
+- **`wait_for_device`** (`timeout`, default 60 s, at most 600): waits until the
+  session is shared and its device connected — joining again if the session
+  is shared anew — and returns the verdict; the tool to call after asking a
+  person to re-plug the adapter.
+- **Notifications**: the server offers the `logging` capability; while a
+  client is attached to a session, a change of its verdict is sent as
+  `notifications/message` (`warning` for down, `notice` for degraded, `info`
+  for ok) with the session, the verdict and the advice. `logging/setLevel`
+  is accepted.
+
+**Acceptance** (over pipes, against a served fake device)
+- With the device absent, `session_status` is `down` with re-plug advice; a
+  `tail` result carries the verdict.
+- `wait_for_device` returns `ok` once the device comes back, and times out
+  cleanly with the verdict when it does not.
+- Dropping the device sends a `warning` notification naming the session;
+  its return sends `notice` then, a minute on, `info`.
+- Stopping the share: the next call reports `down` with advice to share the
+  tab again.
+
+## S45. When each proxy client was last heard
+
+- `ProxyServer.clients()` adds `last_seen` (epoch seconds): the last message
+  from that client, pings included — so an owner can show "claude-ai · 3 s
+  ago", and tell a working agent from one that stopped.
+
+**Acceptance**: a client's `last_seen` moves on with its pings and stays put
+when it is silent.

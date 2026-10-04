@@ -55,6 +55,12 @@ counts towards that refusal.
   unnamed.
 - `replay_available` (optional, server) — how many lines the server *could* have
   offered. Informational.
+- `device` (optional, server) — the device's health right now (SPEC S43):
+  `{"state", "since", "since_epoch", "error", "reconnects", "last_output",
+  "last_output_epoch"}`, `state` being the last `status` the session
+  published (`connecting`, `connected`, `waiting`, `reconnecting`, `error`,
+  `disconnected`). A client must not assume `connected` when this says
+  otherwise; a server without it is taken as connected.
 - `elapsed` (optional, server) — where the server's session is on its own clock,
   in seconds. A client should **adopt this as its own origin** so that replayed
   and live output share one elapsed axis, and so a line's elapsed value means the
@@ -101,7 +107,7 @@ mode (e.g. a mobile viewer).
 ```json
 {"type": "rx", "seq": 12, "wall": "2026-06-12 08:40:20", "elapsed": 10.0042, "hex": "48656c6c6f", "text": "Hello"}
 {"type": "notice", "text": "grep[ERROR] #1: ...", "meta": {}}
-{"type": "status", "state": "connected", "meta": {}}
+{"type": "status", "state": "connected", "meta": {}, "since": "2026-10-04 09:31:02", "since_epoch": 1791077462.1, "reconnects": 1, "error": null}
 {"type": "tx_echo", "seq": 13, "wall": "2026-06-12 08:40:21", "elapsed": 11.2, "text": "reboot"}
 {"type": "pong"}
 ```
@@ -111,6 +117,9 @@ mode (e.g. a mobile viewer).
   client shows it; it must **not** write it (it already reached the device).
   Clients that don't know it should ignore it, as with any unknown `type`.
 
+- `status` — the device's state changed. `since`, `since_epoch`,
+  `reconnects` (connected again after a first connection) and `error` are
+  optional (S43).
 - `rx` — device output, **live only**. `hex` is authoritative (raw bytes); `text`
   is a UTF-8 best-effort decode for display. `wall` is the server's local time
   (`%Y-%m-%d %H:%M:%S`); `elapsed` is seconds since the server session started.

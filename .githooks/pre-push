@@ -1,0 +1,9 @@
+#!/bin/sh
+# Run the tests before anything is pushed: a push with a failing test stops here.
+# Enable once per clone:  git config core.hooksPath .githooks
+# Skip in an emergency:   git push --no-verify
+cd "$(git rev-parse --show-toplevel)" || exit 1
+PY=python3
+[ -x .venv/bin/python ] && PY=.venv/bin/python
+echo "pre-push: running the tests (git push --no-verify skips)" >&2
+"$PY" -m pytest -q -x >&2 || { echo "pre-push: tests failed — not pushing" >&2; exit 1; }

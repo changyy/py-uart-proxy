@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.20261004.1093657] — 2026-10-04
+
+An agent can tell whether the device is really there, and what would help.
+
+### Added
+- **Device health** (SPEC S43): the session keeps its device's state, since
+  when, the error, how often it reconnected and when it last spoke
+  (`UartSession.device_health()`); `auth_ok` carries it, so a client attaching
+  during a drop knows at once, and `status` messages carry `since`,
+  `reconnects` and `error`. `SessionClient` pings and notices a silent link,
+  and `health()` gives one verdict — ok, degraded or down — with advice.
+- **Health through MCP** (SPEC S44): `session_status` reports each link and
+  the advice; results from an unwell session say so first; `wait_for` says
+  whether anyone was there to answer; **`wait_for_device`** waits for the
+  device (or the share) to come back; a change of verdict is sent as an MCP
+  `notifications/message`.
+- `ProxyServer.clients()` adds each client's `last_seen` (SPEC S45).
+- `.githooks/pre-push` runs the tests before a push:
+  `git config core.hooksPath .githooks`.
+
 ## [1.20261003.1000725] — 2026-10-03
 
 Scripts and AI agents can now drive a session somebody shares — and the person
