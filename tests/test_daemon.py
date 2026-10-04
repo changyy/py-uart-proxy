@@ -270,7 +270,7 @@ def test_a_daemon_that_cannot_start_fails_the_command(tmp_path, isolated_home):
     blocker = tmp_path / "in-the-way"
     blocker.write_text("precious")
     result = _cli("start", "--port", device, "--proxy", str(blocker),
-                  "--output-dir", str(tmp_path / "l"), home=isolated_home)
+                  "--output-dir", str(tmp_path / "l"), "--listen-port", "0", home=isolated_home)
     os.close(slave)
     os.close(master)
     assert result.returncode == 1

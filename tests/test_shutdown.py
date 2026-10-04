@@ -99,7 +99,10 @@ def _connect(tmp_path, *extra):
 
 
 @pytest.mark.skipif(not POSIX, reason="needs pty + POSIX signals")
-@pytest.mark.parametrize("extra", [(), ("--serve", "--auth", "123456")],
+# Port 0: the kernel picks a free one, so another run (another Python, in
+# parallel) or anything else on this machine cannot be in the way.
+@pytest.mark.parametrize("extra", [(), ("--serve", "--auth", "123456", "--listen", "127.0.0.1",
+                                        "--listen-port", "0")],
                          ids=["plain", "serve"])
 def test_sigterm_unwinds_in_every_mode(tmp_path, extra):
     """A negative return code means the signal killed the process outright and

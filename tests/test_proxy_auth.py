@@ -112,6 +112,11 @@ def test_guessing_gets_the_address_refused_even_with_the_right_code():
         for _ in range(3):
             with pytest.raises(SocketSourceError, match="invalid code"):
                 _try(server, "guess")
+        # The refusal is sent before the failure is counted and announced: wait
+        # for the notice rather than racing it (it lost on a loaded machine).
+        deadline = time.monotonic() + 3
+        while not any("refusing 127.0.0.1 for 10 min" in n for n in notices) and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert any("refusing 127.0.0.1 for 10 min" in n for n in notices)
 
         with pytest.raises(SocketSourceError, match=r"try again in \d+s"):

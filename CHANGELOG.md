@@ -17,8 +17,8 @@ An agent can tell whether the device is really there, and what would help.
   device (or the share) to come back; a change of verdict is sent as an MCP
   `notifications/message`.
 - `ProxyServer.clients()` adds each client's `last_seen` (SPEC S45).
-- `.githooks/pre-push` runs the tests before a push:
-  `git config core.hooksPath .githooks`.
+- `.githooks/pre-push` runs the tests under Python 3.10–3.13, as CI does,
+  before a push (`scripts/test-pythons.sh`): `git config core.hooksPath .githooks`.
 
 ### Fixed
 - **Output right after attaching could be lost.** The proxy added a client to

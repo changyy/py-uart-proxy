@@ -115,12 +115,17 @@ class TcpDevice:
 
     def send(self, data: bytes) -> None:
         assert _wait_for(lambda: self.conn is not None)
-        self.conn.sendall(data)
+        conn = self.conn
+        if conn is not None:
+            conn.sendall(data)
 
     def drop_client(self) -> None:
-        if self.conn is not None:
-            self.conn.shutdown(socket.SHUT_RDWR)
-            self.conn.close()
+        # One reference: the serving thread sets self.conn to None as soon as
+        # the shutdown below ends its recv(), which raced the close() after it.
+        conn = self.conn
+        if conn is not None:
+            conn.shutdown(socket.SHUT_RDWR)
+            conn.close()
 
     def close(self) -> None:
         self._stop = True

@@ -126,9 +126,11 @@ in a temporary `UART_PROXY_HOME`.
 ## Usage
 
 
-Before a push, the tests run by themselves once the repository's hooks are
-enabled: `git config core.hooksPath .githooks` (a failing test stops the
-push; `git push --no-verify` skips it).
+Before a push, the tests run by themselves — under Python 3.10, 3.11, 3.12
+and 3.13, as CI does — once the repository's hooks are enabled:
+`git config core.hooksPath .githooks` (a failing test stops the push;
+`git push --no-verify` skips it). `scripts/test-pythons.sh [VERSION…]` runs
+the same by hand.
 
 ### 1. List ports
 
