@@ -226,3 +226,20 @@ def test_s41_cli_reaches_a_server_by_address(served):
     device, session, server = served(history=b"hello there\n")
     out = _cli("tail", "--host", "127.0.0.1", "--port", str(server.port), "--auth", "ro")
     assert out.returncode == 0 and "hello there" in out.stdout
+
+
+def test_s41_output_right_after_attaching_is_never_lost(served):
+    """The server must be live for a client the moment it says replay_end.
+
+    It once added the client to its fan-out only after sending the replay, so
+    output in between was lost — rarely, by scheduling (it failed on CI).
+    """
+    device, session, server = served()
+    for i in range(40):
+        client = _client(server, replay=10 if i % 2 else 0)
+        try:
+            device.feed(f"ping {i}\n".encode())
+            assert _wait_for(lambda: any(l["text"] == f"ping {i}" for l in client.tail(5)), 3), \
+                f"attach {i}: output right after attaching was lost"
+        finally:
+            client.close()

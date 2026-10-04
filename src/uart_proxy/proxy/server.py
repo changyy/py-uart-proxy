@@ -390,6 +390,13 @@ class ProxyServer:
             self.limiter.record_success(self._address(client))
             client.role = role
             client.name = str(msg.get("client") or "")[:CLIENT_NAME_MAX]
+            # Live from this moment, under the lock the fan-out takes: whatever the
+            # device says from now on waits in this client's queue (its writer
+            # starts after the replay), and the replay is what came before. Added
+            # only after the replay, output in between was lost.
+            with self._clients_lock:
+                self._clients.add(client)
+                entries = self._replay_entries(msg.get("replay"))
             self._send_now(
                 client,
                 {
@@ -404,36 +411,39 @@ class ProxyServer:
                     "device": _wire_health(self.session.device_health()),
                 },
             )
-            self._send_replay(client, msg.get("replay"))
+            self._send_replay(client, entries)
             return True
         return False  # disconnected before sending auth
 
-    def _send_replay(self, client: _Client, requested) -> None:
+    def _replay_entries(self, requested):
+        """The history a client asked for (``None`` when it asked for none)."""
+        if requested is None:
+            return None
+        try:
+            limit = int(requested)
+        except (TypeError, ValueError):
+            return None
+        if limit <= 0:
+            return None
+        return self.replay.snapshot(limit) if self.replay is not None else []
+
+    def _send_replay(self, client: _Client, entries) -> None:
         """Send the history this client asked for, before any live traffic.
 
-        Sent *before* the client is added to the fan-out set, so replayed lines
-        can never be interleaved with live ones — the client can rely on
-        everything after ``replay_end`` being the present.
+        Sent straight to the socket while the client's writer has not started:
+        live messages queue behind it, so replayed lines are never interleaved
+        with live ones — the client can rely on everything after
+        ``replay_end`` being the present.
 
         Replayed lines go out as their own ``replay`` message type rather than as
         ``rx``: they carry the server's original stamps and must not be mistaken
         for what is happening now. A client that asks for no replay, or an older
         one that does not know the field, gets nothing and behaves exactly as
-        before.
+        before. One that asked gets ``replay_end`` even with nothing to send — a
+        client waiting for it must not wait out its timeout.
         """
-        if requested is None:
+        if entries is None:
             return
-        try:
-            limit = int(requested)
-        except (TypeError, ValueError):
-            return
-        if limit <= 0:
-            return
-        # Answer even with nothing to send. A client that asked is waiting for
-        # `replay_end`; making it wait out its timeout instead (that path exists
-        # only to cope with *older* servers) would put seconds of dead air into
-        # every attach to a session started with --replay-lines 0.
-        entries = self.replay.snapshot(limit) if self.replay is not None else []
         for entry in entries:
             self._send_now(client, entry.to_message())
         self._send_now(client, {

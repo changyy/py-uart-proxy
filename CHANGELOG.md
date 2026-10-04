@@ -20,6 +20,12 @@ An agent can tell whether the device is really there, and what would help.
 - `.githooks/pre-push` runs the tests before a push:
   `git config core.hooksPath .githooks`.
 
+### Fixed
+- **Output right after attaching could be lost.** The proxy added a client to
+  its live fan-out only after sending its replay, so what the device said in
+  between never reached it. It is now live from the moment it is let in, under
+  the fan-out's lock; live output waits behind the replay in its own queue.
+
 ## [1.20261003.1000725] — 2026-10-03
 
 Scripts and AI agents can now drive a session somebody shares — and the person
