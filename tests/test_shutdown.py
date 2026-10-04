@@ -117,3 +117,28 @@ def test_sigterm_unwinds_in_every_mode(tmp_path, extra):
         if proc.poll() is None:
             proc.kill()
         os.close(master)
+
+
+@pytest.mark.skipif(not POSIX, reason="needs a pty")
+def test_an_interrupt_during_start_up_still_unwinds(tmp_path, monkeypatch, capsys):
+    """SIGTERM arriving while the session is still being set up — after the
+    logs are open, while the proxy registers — once escaped every `finally`:
+    the logs were never closed or reported. CI hit it by chance (S16)."""
+    import pty
+
+    from uart_proxy import cli
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt          # what the SIGTERM trap raises
+
+    monkeypatch.setattr(cli, "register_foreground", interrupted)
+    master, slave = pty.openpty()
+    try:
+        code = cli.main(["connect", "--port", os.ttyname(slave), "--no-tui", "--output-dir",
+                         str(tmp_path / "logs"), "--serve", "--auth", "123456",
+                         "--listen", "127.0.0.1", "--listen-port", "0"])
+    finally:
+        os.close(slave)
+        os.close(master)
+    assert code == 130
+    assert "Logs written:" in capsys.readouterr().err

@@ -874,62 +874,61 @@ def _run_session(
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    recorder = _attach_recorder(session, args)
-    plugins = _build_plugins(session, args)
-    try:
-        triggers = _build_triggers(session, args, recorder)
-    except (OSError, ValueError) as exc:
-        print(f"Error: --rules: {exc}", file=sys.stderr)
-        if recorder is not None:
-            close_recorder(recorder)
-        return 1
-    proxy = _maybe_build_proxy(session, args, triggers)
-    mirrors = _maybe_build_pty_proxy(session, args)
-
-    log_dir = os.path.normpath(os.path.dirname(recorder.raw_path)) if recorder is not None else None
-    if log_dir:
-        print(f"Recording to {log_dir}", file=sys.stderr)
-
-    plugins.start()
-    if proxy is not None:
-        proxy.start()
-        # Reflect the port actually bound: with --listen-port 0 the kernel picks
-        # one, and everything downstream (the banner, a daemon's state file) has
-        # to report where clients can really reach us.
-        args.listen_port = proxy.port
-        print(f"Proxy listening on {args.listen}:{proxy.port}", file=sys.stderr)
-        if args.listen in ("0.0.0.0", "::", ""):
-            print("  (every interface — reachable from the network; "
-                  "--listen 127.0.0.1 keeps it on this machine)", file=sys.stderr)
-    if mirrors is not None:
-        session.bus.subscribe(mirrors.handle)
-        mirrors.start()
-        _report_mirrors(mirrors, session.source.description())
-
     # A plain SIGTERM (not just Ctrl-C) has to reach the cleanup in `finally`
     # rather than killing us outright — mirror symlinks are the most visible
     # thing it would strand, but proxy clients and open log files matter too.
+    # Trapped before anything is built, and everything built after it is inside
+    # the `try`: a signal during start-up (registering, binding) still unwinds.
     restore_term = _trap_sigterm()
-
-    # A daemon registers itself (cmd_start); anything else serving does it here.
-    registered = None
-    if proxy is not None and not getattr(args, "daemon", False):
-        registered = register_foreground(args, proxy, log_dir)
-        if registered is not None:
-            print(f"Registered as '{registered.name}' — "
-                  f"'uart-proxy status --show-auth' shows the code again",
-                  file=sys.stderr)
-    info_lines = session_info_lines(proxy, listen=args.listen if proxy else "",
-                                    registered=registered, mirrors=mirrors,
-                                    log_dir=log_dir)
-
-    # Everything a client needs is now in place (listening socket, mirrors), so
-    # a detached start can report success — before the device is necessarily
-    # present, since waiting for one is normal and not a failure to launch.
-    if on_ready is not None:
-        on_ready()
-
+    recorder = plugins = triggers = proxy = mirrors = registered = None
     try:
+        recorder = _attach_recorder(session, args)
+        plugins = _build_plugins(session, args)
+        try:
+            triggers = _build_triggers(session, args, recorder)
+        except (OSError, ValueError) as exc:
+            print(f"Error: --rules: {exc}", file=sys.stderr)
+            return 1
+        proxy = _maybe_build_proxy(session, args, triggers)
+        mirrors = _maybe_build_pty_proxy(session, args)
+
+        log_dir = os.path.normpath(os.path.dirname(recorder.raw_path)) if recorder is not None else None
+        if log_dir:
+            print(f"Recording to {log_dir}", file=sys.stderr)
+
+        plugins.start()
+        if proxy is not None:
+            proxy.start()
+            # Reflect the port actually bound: with --listen-port 0 the kernel picks
+            # one, and everything downstream (the banner, a daemon's state file) has
+            # to report where clients can really reach us.
+            args.listen_port = proxy.port
+            print(f"Proxy listening on {args.listen}:{proxy.port}", file=sys.stderr)
+            if args.listen in ("0.0.0.0", "::", ""):
+                print("  (every interface — reachable from the network; "
+                      "--listen 127.0.0.1 keeps it on this machine)", file=sys.stderr)
+        if mirrors is not None:
+            session.bus.subscribe(mirrors.handle)
+            mirrors.start()
+            _report_mirrors(mirrors, session.source.description())
+
+        # A daemon registers itself (cmd_start); anything else serving does it here.
+        if proxy is not None and not getattr(args, "daemon", False):
+            registered = register_foreground(args, proxy, log_dir)
+            if registered is not None:
+                print(f"Registered as '{registered.name}' — "
+                      f"'uart-proxy status --show-auth' shows the code again",
+                      file=sys.stderr)
+        info_lines = session_info_lines(proxy, listen=args.listen if proxy else "",
+                                        registered=registered, mirrors=mirrors,
+                                        log_dir=log_dir)
+
+        # Everything a client needs is now in place (listening socket, mirrors), so
+        # a detached start can report success — before the device is necessarily
+        # present, since waiting for one is normal and not a failure to launch.
+        if on_ready is not None:
+            on_ready()
+
         if args.no_tui:
             from .ui.headless import run_headless
 
@@ -958,7 +957,8 @@ def _run_session(
             mirrors.stop()
         if proxy is not None:
             proxy.stop()
-        plugins.stop()
+        if plugins is not None:
+            plugins.stop()
         session.stop()
         if triggers is not None:
             triggers.close()

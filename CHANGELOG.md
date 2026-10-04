@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.20261004.1212247] — 2026-10-04
+## [1.20261004.1221145] — 2026-10-04
 
 When the device says X, do Y — as data, within limits, and with the person
 holding the key.
@@ -24,6 +24,13 @@ holding the key.
   `watch_remove`, `read_events`, `wait_for_event`, and `propose_rule` with
   `--allow-send`; events also arrive as notifications.
 
+
+### Fixed
+- **A stop during start-up left the logs open.** SIGTERM was turned into a
+  clean shutdown only once the session was fully set up; one arriving while
+  it registered or bound its proxy escaped every `finally` — the logs were
+  neither closed nor reported. The trap is now set before anything is built,
+  and everything built after it is inside the one `try` that cleans up.
 ## [1.20261004.1093657] — 2026-10-04
 
 An agent can tell whether the device is really there, and what would help.
