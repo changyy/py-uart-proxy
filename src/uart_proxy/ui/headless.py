@@ -77,7 +77,8 @@ def follow_terminal_size(session: UartSession) -> Optional[Callable[[], None]]:
 
 
 def run_headless(session: UartSession, *, ts_mode: str = _TS_REL,
-                 quiet: bool = False, history: Optional[list] = None) -> None:
+                 quiet: bool = False, history: Optional[list] = None,
+                 terminate: Optional[threading.Event] = None) -> None:
     """Start the session and print its line stream until interrupted.
 
     ``quiet`` drops the data stream and keeps only notices and status, on
@@ -117,8 +118,9 @@ def run_headless(session: UartSession, *, ts_mode: str = _TS_REL,
     restore_winch = follow_terminal_size(session)
     try:
         session.start()
-        while not stop.is_set():
-            stop.wait(0.5)
+        # ``terminate``: a SIGTERM, recorded rather than raised (SPEC S16).
+        while not stop.is_set() and not (terminate is not None and terminate.is_set()):
+            stop.wait(0.2)
     except KeyboardInterrupt:
         pass
     finally:

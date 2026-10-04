@@ -39,7 +39,7 @@ from uart_proxy.proxy.protocol import Role
 from uart_proxy.proxy.server import ProxyServer
 from uart_proxy.ui.tui import _TEXTUAL_AVAILABLE
 
-from conftest import FakeSource
+from conftest import FakeSource, wait_or_dump
 
 posix_only = pytest.mark.skipif(not DAEMON_SUPPORTED, reason="POSIX registry")
 
@@ -358,6 +358,7 @@ def test_a_serving_connect_can_be_found_and_joined_from_elsewhere(tmp_path, isol
     master, slave = pty.openpty()
     device = os.ttyname(slave)
     env = dict(os.environ, HOME=str(tmp_path),  # no real config.toml
+               PYTHONFAULTHANDLER="1",       # stacks on SIGABRT, if it hangs (wait_or_dump)
                **{daemon_mod.HOME_ENV: str(isolated_home)})
     proc = subprocess.Popen(
         [sys.executable, "-m", "uart_proxy", "connect", "--port", device,
@@ -387,7 +388,7 @@ def test_a_serving_connect_can_be_found_and_joined_from_elsewhere(tmp_path, isol
         client.close()
     finally:
         proc.terminate()
-        proc.wait(timeout=10)
+        wait_or_dump(proc, 10)
         os.close(master)
         os.close(slave)
     assert list_daemons(include_dead=True) == [], "an ordered exit unregisters"
@@ -399,6 +400,7 @@ def test_a_loopback_bind_does_not_warn_about_the_network(tmp_path, isolated_home
 
     master, slave = pty.openpty()
     env = dict(os.environ, HOME=str(tmp_path),  # no real config.toml
+               PYTHONFAULTHANDLER="1",       # stacks on SIGABRT, if it hangs (wait_or_dump)
                **{daemon_mod.HOME_ENV: str(isolated_home)})
     proc = subprocess.Popen(
         [sys.executable, "-m", "uart_proxy", "connect", "--port", os.ttyname(slave),
@@ -415,6 +417,6 @@ def test_a_loopback_bind_does_not_warn_about_the_network(tmp_path, isolated_home
         assert "generated" not in banner, "a given code is used as given"
     finally:
         proc.terminate()
-        proc.wait(timeout=10)
+        wait_or_dump(proc, 10)
         os.close(master)
         os.close(slave)

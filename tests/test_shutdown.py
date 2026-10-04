@@ -10,10 +10,12 @@ import time
 
 import pytest
 
-from uart_proxy.cli import _trap_sigterm, close_recorder
+from uart_proxy.cli import Termination, _trap_sigterm, close_recorder
 from uart_proxy.core.events import Direction, Event, EventKind
 from uart_proxy.core.recorder import Recorder
 from uart_proxy.core.timestamp import TimestampTracker
+
+from conftest import wait_or_dump
 
 POSIX = os.name == "posix"
 
@@ -42,6 +44,46 @@ def test_the_trap_turns_sigterm_into_keyboardinterrupt():
             handler(signal.SIGTERM, None)
     finally:
         restore()
+
+
+@pytest.mark.skipif(not POSIX, reason="SIGTERM is POSIX-only")
+def test_a_termination_is_recorded_not_raised_until_raising_is_allowed():
+    """Raised between two bytecodes, KeyboardInterrupt can land inside a lock's
+    `with` and leave the lock held — and the shutdown then waits for ever."""
+    term = Termination()
+    restore = _trap_sigterm(term)
+    try:
+        handler = signal.getsignal(signal.SIGTERM)
+        handler(signal.SIGTERM, None)                 # nothing raised
+        assert term.requested.is_set()
+        term.raise_ok = True
+        with pytest.raises(KeyboardInterrupt):
+            handler(signal.SIGTERM, None)
+    finally:
+        restore()
+
+
+def test_headless_returns_on_a_termination_without_an_exception():
+    import threading
+
+    from uart_proxy.core.session import UartSession
+    from uart_proxy.ui.headless import run_headless
+
+    from conftest import FakeSource
+
+    session = UartSession(FakeSource())
+    term = threading.Event()
+    threading.Timer(0.3, term.set).start()
+    done = threading.Event()
+
+    def run():
+        run_headless(session, quiet=True, terminate=term)
+        done.set()
+
+    t = threading.Thread(target=run)
+    t.start()
+    assert done.wait(5), "headless did not return on the request"
+    assert not session.is_running
 
 
 # ── the log summary ─────────────────────────────────────────────────────────
@@ -86,6 +128,7 @@ def _connect(tmp_path, *extra):
          "--port", os.ttyname(slave), "--no-tui",
          "--output-dir", str(tmp_path / "logs"), *extra],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={**os.environ, "PYTHONFAULTHANDLER": "1"},     # stacks on SIGABRT: see wait_or_dump
     )
     os.close(slave)
     deadline = time.monotonic() + 15
@@ -111,7 +154,7 @@ def test_sigterm_unwinds_in_every_mode(tmp_path, extra):
     proc, master = _connect(tmp_path, *extra)
     try:
         proc.send_signal(signal.SIGTERM)
-        assert proc.wait(timeout=10) >= 0, "SIGTERM killed it without unwinding"
+        assert wait_or_dump(proc, 10) >= 0, "SIGTERM killed it without unwinding"
         assert "Logs written:" in proc.stderr.read().decode()
     finally:
         if proc.poll() is None:

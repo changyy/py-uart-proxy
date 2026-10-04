@@ -31,6 +31,13 @@ holding the key.
   it registered or bound its proxy escaped every `finally` — the logs were
   neither closed nor reported. The trap is now set before anything is built,
   and everything built after it is inside the one `try` that cleans up.
+- **A stop could hang the shutdown.** SIGTERM was raised as an exception
+  wherever the main thread was — possibly inside a lock's `with`, leaving
+  the lock held for the shutdown to wait on (a rare CI hang). It is now
+  recorded: headless sessions (and background ones) see it in their wait
+  loop and end without an exception; one during set-up ends the run when
+  set-up is over; the TUI still takes it as Ctrl-C once it runs. Tests that
+  stop a subprocess dump its threads' stacks if it does not exit.
 ## [1.20261004.1093657] — 2026-10-04
 
 An agent can tell whether the device is really there, and what would help.

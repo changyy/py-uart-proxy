@@ -386,11 +386,21 @@ mirror symlinks on disk, proxy client sockets, open log files.
 
 - **`SIGINT` (Ctrl-C)** — ordered shutdown: mirrors → proxy → plugins → session →
   recorder, then the written log files are listed.
-- **`SIGTERM` (`kill`)** — the same ordered shutdown. It is turned into
-  `KeyboardInterrupt` so the `finally` path runs, **in every mode**: not only when
-  `--proxy-dir` made the leak visible, because otherwise an ordered shutdown
-  would depend on which flags were passed, and each newly added resource would
-  have to remember to opt in.
+- **`SIGTERM` (`kill`)** — the same ordered shutdown, **in every mode**: not
+  only when `--proxy-dir` made the leak visible, because otherwise an ordered
+  shutdown would depend on which flags were passed, and each newly added
+  resource would have to remember to opt in.
+  - It is **never raised into whatever the main thread is doing**: an
+    exception thrown between two bytecodes can land inside a lock's `with`
+    and leave the lock held, and the shutdown then waits on it for ever. The
+    handler records the request; where it is acted on is chosen:
+    - **while the session is being set up** (from before the first resource
+      until the UI starts), nothing is raised; when set-up ends, a request
+      seen meanwhile ends the run there, through the same `finally`;
+    - **headless** (and so every background session) watches the request in
+      its wait loop and returns — no exception at all;
+    - **the TUI** gets `KeyboardInterrupt` once it runs, as before (its
+      event loop is where Ctrl-C lands too).
 - **`SIGKILL` (`kill -9`)** — uncatchable; nothing runs, by definition. What that
   costs, measured:
   - Log files keep everything, because the recorder flushes on every write.
@@ -406,7 +416,12 @@ mirror symlinks on disk, proxy client sockets, open log files.
 
 **Acceptance**
 - `_trap_sigterm()` installs a handler that raises `KeyboardInterrupt`, and its
-  returned callable restores the previous handler.
+  returned callable restores the previous handler; given a `Termination`, the
+  handler only records the request until `raise_ok` is set.
+- A request recorded during set-up ends the run when set-up is over, with the
+  logs closed and reported; headless returns on a request without an exception.
+- The tests that send `SIGTERM` to a subprocess dump every thread's stack when it
+  does not exit in time, so a hang on CI says where it is.
 - `connect` sent `SIGTERM` exits with a non-negative status (it unwound rather
   than being killed) and reports the log files it wrote — with **and** without
   `--serve`.

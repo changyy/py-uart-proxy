@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import signal
+import subprocess
 import threading
 
 import pytest
@@ -117,3 +119,19 @@ class FakeSource(DataSource):
 @pytest.fixture
 def fake_source() -> FakeSource:
     return FakeSource()
+
+
+def wait_or_dump(proc, timeout):
+    """proc's exit status — or, when it does not exit in time, fail with every
+    thread's stack (it runs with PYTHONFAULTHANDLER; SIGABRT dumps them)."""
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.send_signal(signal.SIGABRT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        err = proc.stderr.read()
+        err = err.decode("utf-8", "replace") if isinstance(err, bytes) else err
+        pytest.fail(f"did not exit within {timeout}s; its threads:\n{err[-8000:]}")

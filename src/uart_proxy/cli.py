@@ -23,6 +23,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from typing import Callable, Optional
 
@@ -760,8 +761,21 @@ def close_recorder(recorder: Recorder) -> list[str]:
     return paths
 
 
-def _trap_sigterm():
+class Termination:
+    """A SIGTERM, recorded (SPEC S16): ``requested`` is set by the signal;
+    ``KeyboardInterrupt`` is raised only once ``raise_ok`` — never in the
+    middle of setting a session up, where it could leave a lock held."""
+
+    def __init__(self) -> None:
+        self.requested = threading.Event()
+        self.raise_ok = False
+
+
+def _trap_sigterm(term: Optional[Termination] = None):
     """Turn SIGTERM into KeyboardInterrupt so ``finally`` cleanup still runs.
+
+    With ``term``, the signal is recorded in it and raised only while
+    ``term.raise_ok`` (S16).
 
     Installed for *every* session, not just the ones holding an obvious resource:
     without it `kill` bypasses the whole shutdown path, and which resources that
@@ -772,6 +786,10 @@ def _trap_sigterm():
     platform/thread can't install one.
     """
     def _raise(signum, frame):  # noqa: ANN001, ARG001
+        if term is not None:
+            term.requested.set()
+            if not term.raise_ok:
+                return
         raise KeyboardInterrupt
 
     try:
@@ -879,7 +897,8 @@ def _run_session(
     # thing it would strand, but proxy clients and open log files matter too.
     # Trapped before anything is built, and everything built after it is inside
     # the `try`: a signal during start-up (registering, binding) still unwinds.
-    restore_term = _trap_sigterm()
+    term = Termination()
+    restore_term = _trap_sigterm(term)
     recorder = plugins = triggers = proxy = mirrors = registered = None
     try:
         recorder = _attach_recorder(session, args)
@@ -929,14 +948,24 @@ def _run_session(
         if on_ready is not None:
             on_ready()
 
+        # Set up. A SIGTERM that came meanwhile ends the run here — at a point
+        # we chose, never inside a lock (S16).
+        if term.requested.is_set():
+            raise KeyboardInterrupt
         if args.no_tui:
             from .ui.headless import run_headless
 
+            # Headless watches the request itself: no exception at all.
             run_headless(session, ts_mode=args.timestamp,
                          quiet=getattr(args, "daemon", False),
-                         history=history() if history else None)
+                         history=history() if history else None,
+                         terminate=term.requested)
         else:
             from .ui.tui import run_tui
+
+            term.raise_ok = True          # the TUI's loop takes it as Ctrl-C
+            if term.requested.is_set():
+                raise KeyboardInterrupt
 
             run_tui(session, title=title, ts_mode=args.timestamp, log_hint=log_dir,
                     history=history() if history else None,
@@ -949,6 +978,7 @@ def _run_session(
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     finally:
+        term.raise_ok = False             # a second SIGTERM must not cut the cleanup short
         if registered is not None:
             registered.remove()
         if restore_term is not None:
