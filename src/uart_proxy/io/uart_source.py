@@ -29,6 +29,7 @@ _READ_TIMEOUT = 2
 #: TIOCEXCL is missing from ``termios`` on some builds; these are the values the
 #: two platforms we support actually use.
 _TIOCEXCL_FALLBACK = {"darwin": 0x2000740D, "linux": 0x540C}
+_TIOCNXCL_FALLBACK = {"darwin": 0x2000740E, "linux": 0x540D}
 
 
 def seize_exclusive(fd: int) -> bool:
@@ -66,6 +67,32 @@ def seize_exclusive(fd: int) -> bool:
         fcntl.ioctl(fd, request)
     except OSError as exc:
         logger.info("TIOCEXCL failed (%s); port not claimed exclusively", exc)
+        return False
+    return True
+
+
+def release_exclusive(fd: int) -> bool:
+    """Give up a :func:`seize_exclusive` claim, before closing ``fd``.
+
+    Closing alone is not enough: the kernel clears ``TIOCEXCL`` only when the
+    tty's last opener closes it. A pty whose other program keeps it open (socat,
+    QEMU's ``-serial pty``) would stay ``EBUSY`` to every later open — ours
+    included — until that program exits (SPEC S15). Best-effort, like the claim.
+    """
+    if sys.platform == "win32":
+        return False
+    try:
+        import fcntl
+        import termios
+    except ImportError:  # pragma: no cover - POSIX always has these
+        return False
+    request = getattr(termios, "TIOCNXCL", None) or _TIOCNXCL_FALLBACK.get(sys.platform)
+    if request is None:
+        return False
+    try:
+        fcntl.ioctl(fd, request)
+    except OSError as exc:
+        logger.info("TIOCNXCL failed (%s)", exc)
         return False
     return True
 
@@ -122,6 +149,10 @@ class UartSource(DataSource):
                 self.is_exclusive = seize_exclusive(fd)
 
     def close(self) -> None:
+        if self.is_exclusive:
+            fd = self._fileno()
+            if fd is not None:
+                release_exclusive(fd)
         self._dev.close()
         self.is_exclusive = False
 

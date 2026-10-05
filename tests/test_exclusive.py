@@ -1,15 +1,16 @@
 """S15: exclusive claim on the physical port.
 
-What is *not* covered here: that a second ``open()`` of a real serial device
-actually fails. ``TIOCEXCL`` is enforced by the tty driver, and the pty driver —
-the only tty a test can create — ignores it, so the guarantee is only observable
-on real hardware. See SPEC S15 for the manual check. These tests pin down the
-part that is testable: that we ask for the claim, on the right fd, and that
-failing to get one never breaks the session.
+What is *not* covered everywhere: that a second ``open()`` of a real serial
+device actually fails. ``TIOCEXCL`` is enforced by the tty driver; Linux's pty
+driver enforces it too, macOS's ignores it, so there the guarantee is only
+observable on real hardware (SPEC S15 has the manual check). These tests pin
+down that we ask for the claim, on the right fd, that closing gives it up, and
+that failing to get one never breaks the session.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 from types import SimpleNamespace
 
@@ -20,7 +21,7 @@ from uart_proxy.core.events import Direction, Event, EventKind
 from uart_proxy.core.session import UartSession
 from uart_proxy.core.timestamp import TimestampTracker
 from uart_proxy.io import uart_source as mod
-from uart_proxy.io.uart_source import UartSource, seize_exclusive
+from uart_proxy.io.uart_source import UartSource, release_exclusive, seize_exclusive
 
 from conftest import FakeSource
 
@@ -33,6 +34,27 @@ def test_claim_succeeds_on_a_tty():
     master, slave = pty.openpty()
     try:
         assert seize_exclusive(slave) is True
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_closing_gives_the_claim_up_while_the_other_side_stays_open():
+    """S15: a pty kept open by its other program (socat, QEMU's -serial pty)
+    keeps a claim past our close — unless it is given up first."""
+    import pty
+
+    master, slave = pty.openpty()
+    path = os.ttyname(slave)
+    try:
+        assert seize_exclusive(slave) is True
+        try:
+            os.close(os.open(path, os.O_RDWR | os.O_NOCTTY))
+            pytest.skip("this tty driver does not enforce TIOCEXCL (macOS ptys, or root)")
+        except OSError as exc:
+            assert exc.errno == errno.EBUSY
+        assert release_exclusive(slave) is True
+        os.close(os.open(path, os.O_RDWR | os.O_NOCTTY))     # free again
     finally:
         os.close(master)
         os.close(slave)
@@ -122,7 +144,10 @@ def test_close_clears_the_claim(monkeypatch, pty_fd):
     _patch_device(monkeypatch, pty_fd)
     source = UartSource("/dev/cu.fake")
     source.open()
+    released: list[int] = []
+    monkeypatch.setattr(mod, "release_exclusive", lambda fd: (released.append(fd), True)[1])
     source.close()
+    assert released == [pty_fd], "the claim is given up on the port's own fd, before it closes"
     assert source.is_exclusive is False
 
 

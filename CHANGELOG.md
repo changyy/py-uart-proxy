@@ -1,12 +1,18 @@
 # Changelog
 
-## [Unreleased]
+## [1.20261006.1075000] — 2026-10-06
+
+Ports held elsewhere, and virtual ports, behave as they should.
 
 ### Fixed
 - **A COM port held elsewhere was not "busy" on a Windows in another
   language.** "Access is denied" is translated there; it is now recognised by
   its codes (`winerror` 5, pyserial's `PermissionError(13, …, None, 5)`), so
   the busy hint (S21) names the holder and how to join it.
+- **A virtual serial port stayed busy after it was closed.** Closing a port
+  now gives up its exclusive claim (S15) first: the kernel clears it only at
+  the tty's last close, so a pty kept open by its other program (socat,
+  QEMU's `-serial pty`) refused every later open — ours included.
 
 ## [1.20261004.1221145] — 2026-10-04
 

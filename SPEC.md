@@ -329,6 +329,11 @@ symlinked into a directory, that any serial-capable tool can open.
   second program cannot start splitting the byte stream with us. Sharing is done
   through mirrors (S14) or the socket proxy (S6), never by two opens of one wire.
 - `--no-exclusive` opts out.
+- **Closing gives the claim up** (`TIOCNXCL`) before the fd is closed. The
+  kernel clears `TIOCEXCL` only at the tty's last close; a pty whose other
+  program keeps it open (socat, QEMU's `-serial pty`) would otherwise refuse
+  every later open, ours included. Linux's pty driver enforces the claim, so
+  this is tested there; macOS's ignores it.
 - Best-effort by design: Windows COM ports are already exclusive-open, and a
   failure to claim (odd platform, non-tty, a future `uart_helper` that hides its
   port object) is logged and the session continues. `UartSource.is_exclusive`
